@@ -1007,7 +1007,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
-    // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
+    // inject target features from the target's device buffer instead of host copies (opt-in: env LLAMA_DFLASH_DEV=1)
+    // the device buffer costs extra VRAM on the target's output device
     bool use_dev_features = false;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
@@ -1125,7 +1126,7 @@ protected:
             const bool ascending = std::adjacent_find(target_layer_ids, target_layer_ids + target_layer_ids_n,
                     [](int32_t a, int32_t b) { return a >= b; }) == target_layer_ids + target_layer_ids_n;
 
-            use_dev_features = opt.dev_features && ascending && (env == nullptr || atoi(env) != 0);
+            use_dev_features = opt.dev_features && ascending && env != nullptr && atoi(env) != 0;
             if (use_dev_features) {
                 llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
                 use_dev_features = llama_supports_embd_row(ctx_dft);
