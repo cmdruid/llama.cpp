@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -350,6 +351,126 @@ static void test_reasoning_budget_end_match() {
     fprintf(stderr, "  Test 'matched end sequence' passed\n");
 }
 
+// apply the sampler to a fresh vocab of n_vocab tokens and return which tokens remain possible
+static std::vector<bool> get_allowed_tokens(struct llama_sampler * sampler, size_t n_vocab) {
+    std::vector<llama_token_data> cur;
+    for (size_t i = 0; i < n_vocab; i++) {
+        cur.emplace_back(llama_token_data{(llama_token) i, logf((float) (i + 1)), 0.0f});
+    }
+
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(sampler, &cur_p);
+
+    std::vector<bool> allowed(n_vocab);
+    for (size_t i = 0; i < cur.size(); i++) {
+        allowed[cur[i].id] = std::isfinite(cur[i].logit);
+    }
+    return allowed;
+}
+
+static void test_reasoning_transition() {
+    const std::vector<llama_token> start  = {100};
+    const std::vector<llama_token> end    = {101};
+    const std::vector<llama_token> forced = {102, 103, 101}; // budget message (102, 103) + end tag
+
+    // budget not reached: natural end, no transition reported
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 5, REASONING_BUDGET_IDLE);
+        common_reasoning_budget_set_output_limit(sampler, 100);
+
+        for (llama_token t : {100, 50, 51, 101, 52}) {
+            const auto allowed = get_allowed_tokens(sampler, 104);
+            GGML_ASSERT(allowed[50] && allowed[51] && allowed[52] && "no token may be masked before the budget is reached");
+            llama_sampler_accept(sampler, t);
+        }
+
+        const auto tr = common_reasoning_budget_transition(sampler);
+        GGML_ASSERT(tr.started == 0 && tr.completed == 0 && tr.forced_tokens == 0);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+        llama_sampler_free(sampler);
+    }
+
+    // budget exhausted: the message and end tag are forced in order, then the transition is complete
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
+        common_reasoning_budget_set_output_limit(sampler, 100);
+
+        llama_sampler_accept(sampler, 100); // COUNTING
+        llama_sampler_accept(sampler, 50);
+        llama_sampler_accept(sampler, 51);  // budget exhausted -> FORCING
+        GGML_ASSERT(common_reasoning_budget_transition(sampler).started == 0 && "forcing has not emitted a token yet");
+
+        for (size_t i = 0; i < forced.size(); i++) {
+            GGML_ASSERT(get_forced_token(sampler, 103) == forced[i] && "forced tokens out of order");
+            llama_sampler_accept(sampler, forced[i]);
+
+            const auto tr = common_reasoning_budget_transition(sampler);
+            GGML_ASSERT(tr.started == 1);
+            GGML_ASSERT(tr.forced_tokens == (int32_t) i + 1);
+            GGML_ASSERT(tr.completed == (i + 1 == forced.size() ? 1 : 0));
+        }
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+        llama_sampler_free(sampler);
+    }
+
+    // output limit: forcing starts early so the transition and one answer token fit in max_tokens
+    {
+        // reserve = forced.size() + 1 = 4; the reasoning budget itself is never reached
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 1000, REASONING_BUDGET_IDLE);
+        common_reasoning_budget_set_output_limit(sampler, 6);
+
+        llama_sampler_accept(sampler, 100); // remaining output 5
+        GGML_ASSERT(get_allowed_tokens(sampler, 104)[50] && "forced too early");
+        llama_sampler_accept(sampler, 50);  // remaining output 4 == reserve
+
+        for (llama_token t : forced) {
+            GGML_ASSERT(get_forced_token(sampler, 103) == t);
+            llama_sampler_accept(sampler, t);
+        }
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+        // the last token is the answer: a new start tag would re-arm without room, so it is masked
+        const auto allowed = get_allowed_tokens(sampler, 104);
+        GGML_ASSERT(!allowed[100] && allowed[50]);
+
+        const auto tr = common_reasoning_budget_transition(sampler);
+        GGML_ASSERT(tr.started == 1 && tr.completed == 1 && tr.forced_tokens == (int32_t) forced.size());
+
+        // a clone keeps its own counters, reset restores the allowance and clears the counters
+        auto * clone = llama_sampler_clone(sampler);
+        GGML_ASSERT(common_reasoning_budget_transition(clone).completed == 1);
+        llama_sampler_reset(sampler);
+        GGML_ASSERT(common_reasoning_budget_transition(sampler).started == 0);
+        GGML_ASSERT(common_reasoning_budget_transition(clone).started == 1);
+
+        llama_sampler_free(clone);
+        llama_sampler_free(sampler);
+    }
+
+    // an allowance that cannot fit the transition and an answer token is rejected up front
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 10, REASONING_BUDGET_COUNTING);
+        bool threw = false;
+        try {
+            common_reasoning_budget_set_output_limit(sampler, (int32_t) forced.size());
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        GGML_ASSERT(threw && "impossible output limit must be rejected");
+        common_reasoning_budget_set_output_limit(sampler, (int32_t) forced.size() + 1);
+        common_reasoning_budget_set_output_limit(sampler, -1); // unlimited
+
+        llama_sampler_free(sampler);
+    }
+
+    // a null sampler reports no transition
+    GGML_ASSERT(common_reasoning_budget_transition(nullptr).started == 0);
+
+    fprintf(stderr, "  Test 'thinking transition' passed\n");
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -511,8 +632,9 @@ int main(void) {
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
+    test_reasoning_transition();
 
-    printf("OK (12 tests passed)\n");
+    printf("OK (13 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

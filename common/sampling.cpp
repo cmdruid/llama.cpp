@@ -1089,3 +1089,10 @@ void common_sampling_add_grammar_triggers(common_params_sampling & sampling, con
         throw std::runtime_error("Error: no triggers set for lazy grammar!");
     }
 }
+
+void common_sampler_set_output_limit(struct common_sampler * gsmpl, int32_t limit) {
+    if (gsmpl) { common_reasoning_budget_set_output_limit(gsmpl->rbudget, limit); }
+}
+common_reasoning_transition common_sampler_reasoning_transition(const struct common_sampler * gsmpl) {
+    return common_reasoning_budget_transition(gsmpl ? gsmpl->rbudget : nullptr);
+}

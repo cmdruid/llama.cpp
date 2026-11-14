@@ -448,6 +448,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         res["timings"] = stats.to_json();
     }
 
+    res["reasoning_transition"] = reasoning_transition;
     return res;
 }
 
@@ -514,6 +515,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         deltas.front()["__verbose"] = to_json_non_oaicompat();
     }
 
+    deltas.back()["reasoning_transition"] = reasoning_transition;
     return deltas;
 }
 

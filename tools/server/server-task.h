@@ -406,6 +406,7 @@ struct completion_token_output {
 };
 
 struct server_task_result_cmpl_final : server_task_result {
+    json reasoning_transition;
     common_chat_input content;
     llama_tokens tokens;
 

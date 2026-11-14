@@ -2062,6 +2062,8 @@ private:
         if (task.need_sampling()) {
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                const int32_t cap = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+                common_sampler_set_output_limit(slot.smpl.get(), cap);
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -2408,6 +2410,12 @@ private:
 
     void send_final_response(server_slot & slot) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
+        const auto transition = common_sampler_reasoning_transition(slot.smpl.get());
+        res->reasoning_transition = {{"started", transition.started}, {"completed", transition.completed},
+                                    {"forced_tokens", transition.forced_tokens}, {"output_limit", slot.n_predict_max},
+                                    {"prompt_tokens", slot.task->n_tokens()}, {"completion_tokens", slot.stats.n_gen},
+                                    {"cached_tokens", slot.stats.n_prompt_cached},
+                                    {"finish_reason", slot.stop == STOP_TYPE_WORD || slot.stop == STOP_TYPE_EOS ? "stop" : "length"}};
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;

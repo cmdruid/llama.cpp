@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 struct token_matcher {
@@ -65,15 +66,33 @@ struct common_reasoning_budget_ctx {
     size_t force_pos;         // next position in forced_tokens to force
 
     int32_t end_match;        // index into end_matcher.seqs of the sequence that transitioned to DONE, -1 if none
+    int32_t output_limit = -1;
+    int32_t output_remaining = -1;
+    int utf8_pending = 0;
+    common_reasoning_transition transition = {};
 };
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
     return "reasoning-budget";
 }
 
+// Track a byte-token suffix, including a character split across several tokens.
+// Invalid bytes terminate the pending prefix, matching replacement decoding.
+static int utf8_pending_after(int pending, const std::string & piece) {
+    for (unsigned char b : piece) {
+        if (pending && (b & 0xc0) == 0x80) { --pending; continue; }
+        pending = b >= 0xc2 && b <= 0xdf ? 1 : b >= 0xe0 && b <= 0xef ? 2 : b >= 0xf0 && b <= 0xf4 ? 3 : 0;
+    }
+    return pending;
+}
+
 static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_token token) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
+    if (ctx->output_limit >= 0) { --ctx->output_remaining; }
+    if (ctx->vocab) {
+        ctx->utf8_pending = utf8_pending_after(ctx->utf8_pending, common_token_to_piece(ctx->vocab, token, false));
+    }
     switch (ctx->state) {
         case REASONING_BUDGET_IDLE:
         {
@@ -101,11 +120,7 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                 break;
             }
 
-            bool utf8_complete = true;
-            if (ctx->vocab != nullptr) {
-                const std::string piece = common_token_to_piece(ctx->vocab, token, false);
-                utf8_complete = common_utf8_is_complete(piece);
-            }
+            const bool utf8_complete = ctx->utf8_pending == 0;
 
             if (ctx->state == REASONING_BUDGET_WAITING_UTF8) {
                 if (utf8_complete) {
@@ -135,9 +150,12 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
         {
             // track the end sequence within forced_tokens so it is also reported on DONE
             const int32_t match = ctx->end_matcher.advance(token);
+            if (ctx->force_pos == 0) { ++ctx->transition.started; }
+            ++ctx->transition.forced_tokens;
             ctx->force_pos++;
             // an end tag that is already in the prompt (e.g. "<think></think>") also ends forcing
             if (match >= 0 || ctx->force_pos >= ctx->forced_tokens.size()) {
+                ++ctx->transition.completed;
                 ctx->state = REASONING_BUDGET_DONE;
                 ctx->end_match = match;
                 COM_TRC("%s", "forced sequence complete, done\n");
@@ -167,8 +185,31 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
+    const int32_t reserve = (int32_t) ctx->forced_tokens.size() + 1;
+    const bool active = ctx->state == REASONING_BUDGET_COUNTING || ctx->state == REASONING_BUDGET_WAITING_UTF8;
+    if (active && ctx->output_limit >= 0 && ctx->output_remaining <= reserve && ctx->utf8_pending == 0) {
+        ctx->state = REASONING_BUDGET_FORCING;
+        ctx->force_pos = 0;
+        ctx->end_matcher.reset();
+    }
     if (ctx->state != REASONING_BUDGET_FORCING) {
-        // passthrough — don't modify logits
+        if (ctx->output_limit < 0 || (active && ctx->output_remaining >= reserve + 4) ||
+            (!active && ctx->output_remaining > reserve)) { return; }
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token = cur_p->data[i].id;
+            if (active) {
+                const int pending = ctx->vocab ? utf8_pending_after(ctx->utf8_pending, common_token_to_piece(ctx->vocab, token, false)) : 0;
+                // Byte fallback can finish a UTF-8 suffix in at most three tokens.
+                // Do not start a suffix whose completion would consume the reserve.
+                if (ctx->output_remaining - 1 < reserve + pending) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+            } else if (ctx->output_remaining - 1 < reserve) {
+                // A late/repeated opening cannot re-arm a transition without room.
+                auto matcher = ctx->start_matcher;
+                if (matcher.advance(token) >= 0) { cur_p->data[i].logit = -INFINITY; }
+            }
+        }
         return;
     }
 
@@ -194,6 +235,9 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->end_matcher.reset();
     ctx->force_pos = 0;
     ctx->end_match = -1;
+    ctx->output_remaining = ctx->output_limit;
+    ctx->utf8_pending = 0;
+    ctx->transition = {};
 }
 
 static struct llama_sampler * common_reasoning_budget_init_state(
@@ -302,10 +346,28 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
         return false;
     }
 
-    ctx->state = REASONING_BUDGET_FORCING;
+    ctx->state = ctx->utf8_pending ? REASONING_BUDGET_WAITING_UTF8 : REASONING_BUDGET_FORCING;
     ctx->force_pos = 0;
     ctx->end_matcher.reset();
     COM_TRC("%s", "forced into forcing state (manual transition)\n");
 
     return true;
+}
+
+void common_reasoning_budget_set_output_limit(struct llama_sampler * smpl, int32_t limit) {
+    if (!smpl) { return; }
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+    if (limit < -1 || ctx->forced_tokens.empty()) {
+        throw std::invalid_argument("invalid thinking transition/output allowance");
+    }
+    const bool active = ctx->state != REASONING_BUDGET_IDLE && ctx->state != REASONING_BUDGET_DONE;
+    if (active && limit >= 0 && limit < (int32_t) ctx->forced_tokens.size() + 1 + ctx->utf8_pending) {
+        throw std::invalid_argument("max_tokens cannot fit the complete thinking transition and an answer token");
+    }
+    ctx->output_limit = ctx->output_remaining = limit;
+    ctx->transition = {};
+}
+
+common_reasoning_transition common_reasoning_budget_transition(const struct llama_sampler * smpl) {
+    return smpl ? ((const common_reasoning_budget_ctx *) smpl->ctx)->transition : common_reasoning_transition{};
 }

@@ -47,6 +47,17 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
 // was recorded. Cleared when a new start sequence re-arms the sampler.
 const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
 
+struct common_reasoning_transition {
+    int32_t started = 0;
+    int32_t completed = 0;
+    int32_t forced_tokens = 0;
+};
+
+// Set after accepting prompt prefill; counts only generated accepts. Clones keep
+// their own remaining allowance. Throws before generation for impossible prefill.
+void common_reasoning_budget_set_output_limit(struct llama_sampler * smpl, int32_t limit);
+common_reasoning_transition common_reasoning_budget_transition(const struct llama_sampler * smpl);
+
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);
