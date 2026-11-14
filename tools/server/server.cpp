@@ -33,8 +33,16 @@ static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
+        // systemd may send SIGTERM again after the canary wrapper exits.
+        // Let the first graceful shutdown finish; exit() here would run global
+        // CUDA-owning destructors concurrently with context destruction.
+        if (signal == SIGTERM) {
+            return;
+        }
+        // Preserve the operator's second Ctrl+C escape without C++ teardown
+        // from a signal handler or CUDA calls after runtime finalization.
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+        _Exit(1);
     }
 
     shutdown_handler(signal);
