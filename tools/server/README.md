@@ -1335,7 +1335,8 @@ Saves the conversation of every non-empty slot to the prompt cache and, with `--
 disk yet, the most recently saved first, and waits until the disk writer is done (at most `--cache-persist-timeout`
 seconds). A slot that is processing a task is saved as it
 stands between two decoding steps (counted in `n_busy`); the task is not interrupted. A gateway calls this before it
-stops the server; the server does the same on a graceful shutdown (SIGTERM) and before it goes to sleep.
+stops the server; the server does the same on a graceful shutdown (SIGTERM), and before it goes to sleep (there without
+waiting: the writer finishes in the background while the server sleeps).
 
 **Response format**
 
@@ -2682,16 +2683,21 @@ a write, the entries it supersedes stay on disk until it completes. Prompts with
 
 **Write-behind.** An entry is not written when it is saved to RAM, but when one of these happens first:
 - it has stayed in the RAM cache unwritten for `--cache-dir-delay` seconds (default 60; 0 writes it at once);
-- the RAM cache drops it to stay within `--cache-ram`: the writer keeps its memory until it is written;
+- the RAM cache drops it to stay within `--cache-ram`: the writer keeps its memory until it is written. To bound that
+  memory to one entry beyond `--cache-ram`, the server waits for the writer before it hands it another such entry
+  (`backlog_waits`, `backlog_wait_ms`, `released_entries`/`released_bytes` in `GET /cache`); if the writer does not
+  keep up within `--cache-persist-timeout`, the entry is dropped instead (`writes_dropped`);
 - `POST /cache/persist`, a graceful shutdown or going to sleep: everything not written yet is written, the most
-  recently saved first, within `--cache-persist-timeout`.
+  recently saved first, within `--cache-persist-timeout` (going to sleep does not wait for it).
 
 An entry that a request continues before its delay expires leaves RAM for the slot and is never written: an active
 conversation is written once it pauses for the delay, not after every turn. A copy already on disk (the entry was read
 from disk, or written earlier) stays until the continuation is written and supersedes it. A crash (SIGKILL, power
 loss) therefore loses at most the progress of the conversations during the last `--cache-dir-delay` seconds (they
 resume from their previous copy on disk, or cold) and what is live in the slots; a graceful stop loses nothing that
-fits in `--cache-persist-timeout`.
+fits in `--cache-persist-timeout`. A request that is cancelled while it waits for a disk read releases the read: its
+state is not kept (`waiting` in `GET /cache` counts the requests waiting for a read, `disk.loaded` the reads not taken
+yet).
 
 ## Sleeping on Idle
 

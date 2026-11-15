@@ -1039,6 +1039,12 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"backlog_entries", st.n_backlog},
         {"backlog_bytes",   st.n_backlog_bytes},
         {"loading",         st.n_loading},
+        {"loaded",          st.n_loaded},
+        {"released_entries", st.n_released},
+        {"released_bytes",  st.n_released_bytes},
+        {"backlog_waits",   st.n_backlog_waits},
+        {"backlog_wait_ms", st.t_backlog_wait_ms},
+        {"writes_dropped",  st.n_write_dropped},
         {"writes",          st.n_writes},
         {"writes_skipped",  st.n_write_skipped},
         {"writes_present",  st.n_write_present},
@@ -1222,8 +1228,12 @@ private:
             SRV_INF("%s", "server is entering sleeping state\n");
 
             // sleeping discards the slots and the RAM cache, keep their conversations on disk
+            // this runs with the task queue locked: the slots are saved, the writer finishes in the background (it keeps
+            // the states it writes), so that HTTP threads are not held up by the disk
             if (cache_disk) {
-                cache_persist_and_flush("sleep");
+                const auto res = cache_persist();
+                SRV_INF("persist before sleep: %d slots saved, %zu entries (%.3f MiB) are written in the background\n",
+                        res.n_saved, cache_disk->stats().n_backlog, cache_disk->stats().n_backlog_bytes / (1024.0 * 1024.0));
             }
 
             destroy();
@@ -2160,6 +2170,7 @@ private:
 
         cache_disk = server_cache_disk::open(params_base.cache_dir, name, key, (size_t) params_base.cache_dir_max_mib*1024*1024,
             (int64_t) params_base.cache_dir_delay*1000,
+            (int64_t) params_base.cache_persist_timeout*1000,
             [this](uint64_t) {
                 // called from the reader thread
                 server_task task(SERVER_TASK_TYPE_CACHE_LOADED);
@@ -2247,6 +2258,24 @@ private:
                     queue_tasks.pop_deferred_task_by_id(id_task);
                 }
             }
+        }
+    }
+
+    // a task waiting for a disk read was cancelled: forget it, and the read if no other task waits for it
+    void cache_disk_cancel(int id_task) {
+        auto it = cache_disk_waiting_task.find(id_task);
+        if (it == cache_disk_waiting_task.end()) {
+            return;
+        }
+
+        const uint64_t id = it->second;
+        cache_disk_waiting_task.erase(it);
+
+        const bool wanted = std::any_of(cache_disk_waiting_task.begin(), cache_disk_waiting_task.end(), [&](const auto & w) {
+            return w.second == id;
+        });
+        if (id != 0 && !wanted && cache_disk) {
+            cache_disk->discard(id);
         }
     }
 
@@ -2402,6 +2431,7 @@ private:
         return json {
             {"ram",      ram},
             {"disk",     server_cache_disk_status(cache_disk.get())},
+            {"waiting",  cache_disk_waiting_task.size()},
             {"counters", counters},
             {"slots",    slots_data},
         };
@@ -3628,6 +3658,8 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    cache_disk_cancel(task.id_target);
+
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {

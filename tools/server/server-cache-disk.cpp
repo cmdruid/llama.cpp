@@ -327,11 +327,14 @@ struct server_cache_disk::state {
     size_t      n_bytes_max = 0;
 
     int64_t     t_delay_ms  = 0;
+    int64_t     t_wait_max_ms = 0; // how long release() waits for the writer
 
     std::function<void(uint64_t)> on_loaded;
 
-    // test only: delay of the reader after a read (env LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS)
-    int64_t t_test_read_delay_ms = 0;
+    // test only: delay of the reader after a read and of the writer before a write
+    // (env LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS, LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS)
+    int64_t t_test_read_delay_ms  = 0;
+    int64_t t_test_write_delay_ms = 0;
 
     mutable std::mutex mtx;
     mutable std::condition_variable cv_jobs;   // writer and reader wait for work
@@ -372,6 +375,7 @@ struct server_cache_disk::state {
     std::set<uint64_t>            quarantined; // failed to restore, not offered again
     std::deque<uint64_t>          load_queue;
     std::map<uint64_t, std::shared_ptr<loaded_entry>> loaded;
+    std::set<uint64_t>            discarded;   // reads in progress whose result nobody waits for any more
     std::map<uint64_t, staged_write> staged;   // the writes not started yet
     size_t                        staged_bytes = 0;
     std::deque<file_op>           ops;
@@ -379,6 +383,7 @@ struct server_cache_disk::state {
     uint64_t                      cur_flush = 0;
     size_t                        cur_bytes = 0;
     size_t                        cur_reserved = 0; // counted in n_bytes while its temporary file exists
+    bool                          cur_released = false;
     uint64_t                      flush_seq = 0;
     bool                          stopping   = false;
     bool                          writer_exited = false;
@@ -1099,6 +1104,10 @@ struct server_cache_disk::state {
 
         const int64_t t_start = ggml_time_us();
 
+        if (t_test_write_delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(t_test_write_delay_ms));
+        }
+
         std::string err;
         bool dir_missing = false;
         bool ok = write_file(job, err, dir_missing);
@@ -1248,6 +1257,7 @@ struct server_cache_disk::state {
                     cur_id      = it->first;
                     cur_flush   = it->second.flush;
                     cur_bytes   = job.n_bytes;
+                    cur_released = it->second.released;
                     staged_bytes -= job.n_bytes;
                     staged.erase(it);
                     break;
@@ -1295,9 +1305,10 @@ struct server_cache_disk::state {
             job = write_job();
 
             lock.lock();
-            cur_id    = 0;
-            cur_flush = 0;
-            cur_bytes = 0;
+            cur_id       = 0;
+            cur_flush    = 0;
+            cur_bytes    = 0;
+            cur_released = false;
             lock.unlock();
 
             cv_done.notify_all();
@@ -1409,7 +1420,10 @@ struct server_cache_disk::state {
                     }
                 }
 
-                loaded[id] = res;
+                // the task that wanted it was cancelled: release the memory now
+                if (discarded.erase(id) == 0) {
+                    loaded[id] = res;
+                }
             }
 
             cv_jobs.notify_all();
@@ -1479,6 +1493,7 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
         const std::string & key,
         size_t n_bytes_max,
         int64_t t_delay_ms,
+        int64_t t_wait_max_ms,
         std::function<void(uint64_t)> on_loaded) {
 #ifdef _WIN32
     GGML_UNUSED(dir_root);
@@ -1486,6 +1501,7 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     GGML_UNUSED(key);
     GGML_UNUSED(n_bytes_max);
     GGML_UNUSED(t_delay_ms);
+    GGML_UNUSED(t_wait_max_ms);
     GGML_UNUSED(on_loaded);
     DSK_ERR("%s", "the disk prompt cache is not supported on Windows\n");
     return nullptr;
@@ -1517,11 +1533,16 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     s.key_hash    = key_hash;
     s.n_bytes_max = n_bytes_max;
     s.t_delay_ms  = t_delay_ms;
+    s.t_wait_max_ms = t_wait_max_ms;
     s.on_loaded   = std::move(on_loaded);
 
     if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS")) {
         s.t_test_read_delay_ms = atoll(v);
         DSK_WRN("test: the reader waits %" PRId64 " ms after each read\n", s.t_test_read_delay_ms);
+    }
+    if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS")) {
+        s.t_test_write_delay_ms = atoll(v);
+        DSK_WRN("test: the writer waits %" PRId64 " ms before each write\n", s.t_test_write_delay_ms);
     }
     s.st.n_bytes_max = n_bytes_max;
 
@@ -1638,6 +1659,7 @@ void server_cache_disk::stage_locked(const server_prompt_cache_state & state, bo
     }
 
     if (id == st->cur_id) {
+        st->cur_released = st->cur_released || released;
         return;
     }
 
@@ -1697,11 +1719,69 @@ void server_cache_disk::drop(uint64_t id) {
 }
 
 void server_cache_disk::release(const server_prompt_cache_state & state) {
-    {
-        std::unique_lock<std::mutex> lock(st->mtx);
-        stage_locked(state, true);
+    llama_tokens tokens;
+    uint64_t id = 0;
+    if (!disk_entry_id(state, tokens, id)) {
+        return;
     }
+
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    if (id == st->cur_id) {
+        st->cur_released = true;
+        return;
+    }
+
+    const bool needed = st->staged.count(id) || !st->index.count(id) || st->is_removing_locked(id);
+
+    // the memory of the released entries is not counted by the RAM cache: it is bounded to one entry beyond --cache-ram
+    // by waiting for the writer before releasing another one; this blocks the server loop, but only when the RAM cache
+    // drops entries faster than the disk takes them
+    const auto n_released = [&] {
+        size_t n = st->cur_released ? 1 : 0;
+        for (const auto & [i, w] : st->staged) {
+            n += w.released ? 1 : 0;
+        }
+        return n;
+    };
+
+    if (needed && n_released() > 0 && !st->stopping) {
+        const int64_t t_start = ggml_time_ms();
+
+        st->st.n_backlog_waits++;
+        st->cv_jobs.notify_all();
+
+        const bool ok = st->cv_done.wait_for(lock, std::chrono::milliseconds(st->t_wait_max_ms), [&] {
+            return n_released() == 0 || st->writer_exited || st->stopping;
+        });
+
+        st->st.t_backlog_wait_ms += ggml_time_ms() - t_start;
+
+        if (!ok) {
+            DSK_ERR("the disk writer did not keep up for %.1f s, dropping entry %s instead of holding its memory\n",
+                    st->t_wait_max_ms / 1000.0, hex64(id).c_str());
+            if (auto it = st->staged.find(id); it != st->staged.end()) {
+                st->staged_bytes -= it->second.job.n_bytes;
+                st->staged.erase(it);
+            }
+            st->st.n_write_dropped++;
+            return;
+        }
+    }
+
+    stage_locked(state, true);
+
+    lock.unlock();
     st->cv_jobs.notify_all();
+}
+
+void server_cache_disk::discard(uint64_t id) {
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    st->loaded.erase(id);
+    if (st->loading.count(id)) {
+        st->discarded.insert(id);
+    }
 }
 
 uint64_t server_cache_disk::flush() {
@@ -1751,6 +1831,7 @@ bool server_cache_disk::load_async(uint64_t id) {
     st->loading.insert(id);
     st->load_queue.push_back(id);
     st->loaded.erase(id);
+    st->discarded.erase(id);
 
     lock.unlock();
     st->cv_jobs.notify_all();
@@ -1892,6 +1973,15 @@ server_cache_disk_stats server_cache_disk::stats() const {
     res.n_bytes_max     = st->n_bytes_max;
     res.n_backlog       = st->staged.size() + (st->cur_id != 0 ? 1 : 0);
     res.n_backlog_bytes = st->staged_bytes + st->cur_bytes;
+    res.n_released       = st->cur_released ? 1 : 0;
+    res.n_released_bytes = st->cur_released ? st->cur_bytes : 0;
+    for (const auto & [id, w] : st->staged) {
+        if (w.released) {
+            res.n_released++;
+            res.n_released_bytes += w.job.n_bytes;
+        }
+    }
+    res.n_loaded = st->loaded.size();
     res.t_delay_ms      = st->t_delay_ms;
     res.n_loading       = st->loading.size();
     return res;

@@ -359,7 +359,7 @@ def test_sleep_persists():
     while "persist before sleep" not in log.drain():
         assert time.time() - t0 < 10
         time.sleep(0.1)
-    assert len(entry_files()) == 1
+    wait_entries(1)
 
     res = server.make_request("GET", "/cache")
     assert res.status_code == 200
@@ -908,3 +908,93 @@ def test_stale_temporary_files():
     st = cache_status()["disk"]
     assert st["bytes"] == 1000
     assert st["other_entries"] == 1
+
+
+WRITE_DELAY_ENV = "LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS"
+
+
+# the entries that the RAM cache drops are held by the writer until they are written: at most one at a time, the
+# server loop waits for the writer before it hands it another
+def test_backlog_bounded_beyond_ram(monkeypatch):
+    global server
+    monkeypatch.setenv(WRITE_DELAY_ENV, "1500")
+    server.cache_dir_delay = 60
+    server.cache_ram = 1 # MiB, about two of these conversations
+    server.start()
+
+    seen = []
+    stop = threading.Event()
+    def watch():
+        while not stop.is_set():
+            seen.append(cache_status()["disk"]["released_entries"])
+            time.sleep(0.05)
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    try:
+        for i in range(4):
+            complete(conversation(i, 4))
+        complete(OTHER_PROMPT)
+    finally:
+        stop.set()
+        watcher.join()
+
+    st = wait_disk("writes", 2)
+    assert st["backlog_waits"] >= 1
+    assert st["backlog_wait_ms"] > 500
+    assert st["writes_dropped"] == 0
+    assert max(seen) <= 1
+    assert st["released_entries"] == 0
+
+
+# a task waiting for a disk read is cancelled (the client went away): its row and the read result are released
+def test_cancelled_waiting_task_releases_read(monkeypatch):
+    global server
+    import requests
+    server.start()
+    complete(LONG_PROMPT)
+    restart()
+    server.stop()
+
+    monkeypatch.setenv(READ_DELAY_ENV, "2000")
+    server.start()
+    log = LogReader(server.log_path)
+    try:
+        requests.post(f"http://{server.server_host}:{server.server_port}/completion", json={
+            "prompt": LONG_PROMPT + " The knight finally reached the castle gates.",
+            "cache_prompt": True,
+        }, timeout=0.5)
+        assert False, "the request should have timed out"
+    except requests.exceptions.Timeout:
+        pass
+    assert "reading disk cache entry" in log.wait_for("reading disk cache entry")
+
+    t0 = time.time()
+    while True:
+        st = cache_status()
+        if st["disk"]["loading"] == 0 and st["waiting"] == 0:
+            break
+        assert time.time() - t0 < 10, st
+        time.sleep(0.1)
+    assert st["disk"]["loaded"] == 0
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" not in log.drain()
+
+
+# going to sleep does not wait for the disk writer with the task queue locked: HTTP requests are answered meanwhile
+def test_sleep_does_not_wait_for_writer(monkeypatch):
+    global server
+    monkeypatch.setenv(WRITE_DELAY_ENV, "3000")
+    server.sleep_idle_seconds = 1
+    server.start()
+    log = LogReader(server.log_path)
+
+    complete(LONG_PROMPT)
+    assert "persist before sleep" in log.wait_for("persist before sleep", timeout=10)
+
+    t0 = time.time()
+    st = cache_status()
+    assert time.time() - t0 < 1.0
+    assert st["sleeping"] is True
+    assert st["disk"]["backlog_entries"] == 1
+
+    st = wait_disk("writes", 1)
+    assert len(entry_files()) == 1

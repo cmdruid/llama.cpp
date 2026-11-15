@@ -62,6 +62,12 @@ struct server_cache_disk_stats {
     size_t n_backlog       = 0; // entries not written yet: waiting for their delay, queued or in progress
     size_t n_backlog_bytes = 0;
     size_t n_loading       = 0; // reads in progress
+    size_t n_loaded        = 0; // reads done, not taken yet
+
+    size_t n_released       = 0; // entries of the backlog that the RAM cache dropped: memory beyond --cache-ram
+    size_t n_released_bytes = 0;
+    uint64_t n_backlog_waits   = 0; // times the server loop waited for the writer, see release()
+    int64_t  t_backlog_wait_ms = 0;
 
     int64_t t_delay_ms = 0;
 
@@ -70,6 +76,7 @@ struct server_cache_disk_stats {
     uint64_t n_write_present = 0; // already on disk
     uint64_t n_write_no_room = 0; // larger than the bound
     uint64_t n_write_errors  = 0;
+    uint64_t n_write_dropped = 0; // dropped by the RAM cache while the writer did not keep up
     uint64_t n_reads         = 0;
     uint64_t n_read_errors   = 0;
     uint64_t n_removed_corrupt    = 0;
@@ -114,6 +121,7 @@ struct server_cache_disk {
             const std::string & key,
             size_t n_bytes_max,
             int64_t t_delay_ms,
+            int64_t t_wait_max_ms,
             std::function<void(uint64_t)> on_loaded);
 
     ~server_cache_disk();
@@ -127,6 +135,8 @@ struct server_cache_disk {
     void drop(uint64_t id);
 
     // the RAM cache drops the entry to stay within its limits: write it now, unless it is already on disk
+    // the writer then holds its memory: if it holds another such entry already, this waits until that one is written
+    // (at most t_wait_max_ms, then the entry is dropped), so that the memory beyond --cache-ram stays within one entry
     void release(const server_prompt_cache_state & state);
 
     // write every entry not written yet, the most recently saved first; returns the ticket for wait()
@@ -138,6 +148,9 @@ struct server_cache_disk {
     // read an entry in the background, then call on_loaded(id); false if the entry is unknown
     // true if the read is started or already in progress
     bool load_async(uint64_t id);
+
+    // nobody waits for the read of this entry any more: release its result now or when the read ends
+    void discard(uint64_t id);
 
     // take the state read by load_async(); LOAD_FAILED if the read failed (a corrupt file is removed)
     load_result take_loaded(uint64_t id, server_prompt_cache_state & out, bool has_mtmd);
