@@ -1050,6 +1050,7 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"removed_evicted",    st.n_removed_evicted},
         {"removed_superseded", st.n_removed_superseded},
         {"removed_missing",    st.n_removed_missing},
+        {"quarantined",        st.n_quarantined},
         {"bytes_written",   st.n_bytes_written},
         {"bytes_skipped",   st.n_bytes_skipped},
         {"bytes_read",      st.n_bytes_read},
@@ -1987,15 +1988,17 @@ private:
                 if (!ok) {
                     ret->prompt_clear();
 
-                    // without other slots holding cells, the state does not fit this context: drop the entry
+                    // without other slots holding cells, the state does not fit this context now: drop the entry from RAM
+                    // a failed restore does not prove that the entry is bad (only its checksums do), so its disk copy is
+                    // kept for a later run; this server does not offer it again, the request proceeds without it
                     const bool busy = std::any_of(slots.begin(), slots.end(), [&](const server_slot & s) {
                         return s.id != ret->id && s.prompt.n_tokens() > 0;
                     });
                     if (prompt_cache->id_failed != 0 && !(params_base.kv_unified && busy)) {
-                        SLT_WRN(*ret, "%s", "dropping the prompt cache entry that failed to restore\n");
+                        SLT_WRN(*ret, "%s", "dropping the prompt cache entry that failed to restore from RAM, keeping its disk copy\n");
                         prompt_cache->erase(prompt_cache->id_failed);
                         if (cache_disk) {
-                            cache_disk->remove(prompt_cache->id_failed);
+                            cache_disk->quarantine(prompt_cache->id_failed);
                         }
                     }
                     prompt_cache->id_failed = 0;
@@ -2087,6 +2090,9 @@ private:
 
         ss << "format: llama-server prompt cache 1, llama state seq " << LLAMA_STATE_SEQ_VERSION << "\n";
 
+        // another build may lay out or compute a state differently: an upgrade starts cold
+        ss << "build: " << llama_build_number() << " " << llama_commit() << "\n";
+
         buf[0] = 0;
         llama_model_meta_val_str(model_tgt, "general.architecture", buf, sizeof(buf));
         ss << "arch: " << buf << "\n";
@@ -2094,9 +2100,23 @@ private:
         ss << "model: " << buf << ", " << llama_model_n_params(model_tgt) << " params, " << llama_model_size(model_tgt) << " bytes\n";
         ss << "model files: " << files(params_base.model) << "\n";
 
+        for (const auto & kv : params_base.kv_overrides) {
+            if (kv.key[0] == 0) {
+                break;
+            }
+            ss << "override: " << kv.key << " = ";
+            switch (kv.tag) {
+                case LLAMA_KV_OVERRIDE_TYPE_INT:   ss << "int:"   << kv.val_i64;  break;
+                case LLAMA_KV_OVERRIDE_TYPE_FLOAT: ss << "float:" << kv.val_f64;  break;
+                case LLAMA_KV_OVERRIDE_TYPE_BOOL:  ss << "bool:"  << kv.val_bool; break;
+                case LLAMA_KV_OVERRIDE_TYPE_STR:   ss << "str:"   << kv.val_str;  break;
+            }
+            ss << "\n";
+        }
+
         ss << "context: n_ctx_seq " << llama_n_ctx_seq(ctx_tgt) << ", n_stream " << (params_base.kv_unified ? 1 : params_base.n_parallel)
            << ", kv_unified " << params_base.kv_unified << ", swa_full " << params_base.swa_full << ", n_swa " << n_swa
-           << ", flash_attn " << (int) params_base.flash_attn_type << "\n";
+           << ", flash_attn " << (llama_flash_attn_enabled(ctx_tgt) ? "on" : "off") << "\n";
         ss << "kv types: " << ggml_type_name(params_base.cache_type_k) << " " << ggml_type_name(params_base.cache_type_v) << "\n";
         ss << "rope: scaling " << (int) params_base.rope_scaling_type << ", freq_base " << params_base.rope_freq_base
            << ", freq_scale " << params_base.rope_freq_scale << ", yarn " << params_base.yarn_ext_factor << " " << params_base.yarn_attn_factor

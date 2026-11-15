@@ -1957,7 +1957,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const auto & data = it_best->data->main;
 
         const size_t size = data.size();
-        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        const size_t n = test_restore_fail ? 0 : llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
         if (n != size) {
             SRV_ERR("failed to restore state with size %zu\n", size);
 
@@ -2117,8 +2117,9 @@ void server_prompt_cache::erase(uint64_t id) {
     }
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->id == id) {
+            // not proven bad: the disk writer keeps it, as for an eviction
             if (disk) {
-                disk->drop(id);
+                disk->release(*it);
             }
             states.erase(it);
             return;

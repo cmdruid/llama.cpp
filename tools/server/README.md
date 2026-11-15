@@ -2652,14 +2652,18 @@ assistant turns after it may be rendered differently when the client sends them 
   turn) gets a copy: the original stays cached, and the branch is saved as an entry of its own when it leaves the slot.
 
 **Disk tier.** Entries are stored in `DIR/<arch>-<hash>/`, where the hash covers everything that shapes a saved state:
-the model and draft model files (size and hashes of their first and last MiB), the context size per sequence, unified
-KV, the K/V types, flash attention, SWA, RoPE settings, LoRA adapters, control vectors and the speculative types (the
-key is written to `IDENTITY`). A state is only loaded by a server with the same key; several keys can share `DIR`
+the build (number and commit: an upgraded server starts cold), the model and draft model files (size and hashes of their
+first and last MiB), `--override-kv` values, the context size per sequence, unified KV, the K/V types, flash attention
+as resolved (not as requested: `auto` may resolve differently on other hardware), SWA, RoPE settings, LoRA adapters,
+control vectors and the speculative types (the key is written to `IDENTITY`). A state is only loaded by a server with the same key; several keys can share `DIR`
 (one server process at a time: a second process with another key may remove the first one's files to stay within the
 bound, which costs it the entries but nothing else).
 Files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is removed, never loaded.
 An entry whose file is gone (removed by hand, or with the directory) is dropped from the index when it is next read or
 touched, and the request waiting for it proceeds without it; a removed directory is created again by the next write.
+A state that fails to restore (for instance it does not fit beside the other slots) is not proof that the entry is bad:
+the request proceeds without it, the file is kept for a later run and this server does not offer it again
+(`quarantined` in `GET /cache`); only a checksum or format error removes a file.
 At start-up only the headers and tokens are read. A request that a disk entry serves better than RAM waits while the
 entry is read in the background (other requests are not blocked), then it is restored as from RAM; the disk copy is
 kept. An entry superseded by a newer one while it is being read is removed when the read ends; the waiting request

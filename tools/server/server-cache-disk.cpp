@@ -343,6 +343,7 @@ struct server_cache_disk::state {
     size_t                        n_bytes_others = 0;
     std::vector<llama_tokens>     live;        // the conversations of the slots
     std::set<uint64_t>            loading;     // reads requested or in progress
+    std::set<uint64_t>            quarantined; // failed to restore, not offered again
     std::deque<uint64_t>          load_queue;
     std::map<uint64_t, std::shared_ptr<loaded_entry>> loaded;
     std::map<uint64_t, staged_write> staged;   // the writes not started yet
@@ -351,7 +352,6 @@ struct server_cache_disk::state {
     uint64_t                      cur_id    = 0; // the write in progress, 0 = none
     uint64_t                      cur_flush = 0;
     size_t                        cur_bytes = 0;
-    bool                          cur_removed = false; // remove() was called during the write
     uint64_t                      flush_seq = 0;
     bool                          stopping   = false;
     bool                          writer_exited = false;
@@ -1056,13 +1056,6 @@ struct server_cache_disk::state {
 
         n_bytes -= job.n_bytes;
 
-        // removed by remove() during the write
-        if (ok && cur_removed) {
-            lock.unlock();
-            unlink_files({ path_of(job.id) });
-            return;
-        }
-
         if (!ok) {
             if (!abort.load()) {
                 DSK_ERR("failed to write entry %s: %s\n", hex64(job.id).c_str(), err.c_str());
@@ -1172,7 +1165,6 @@ struct server_cache_disk::state {
                     cur_id      = it->first;
                     cur_flush   = it->second.flush;
                     cur_bytes   = job.n_bytes;
-                    cur_removed = false;
                     staged_bytes -= job.n_bytes;
                     staged.erase(it);
                     break;
@@ -1642,7 +1634,7 @@ std::vector<server_cache_disk::entry_ptr> server_cache_disk::entries() const {
     std::vector<entry_ptr> res;
     res.reserve(st->index.size());
     for (const auto & [id, r] : st->index) {
-        if (!r.removing) {
+        if (!r.removing && !st->quarantined.count(id)) {
             res.push_back(r.e);
         }
     }
@@ -1656,7 +1648,7 @@ bool server_cache_disk::load_async(uint64_t id) {
         return true;
     }
 
-    if (st->stopping || !st->index.count(id) || st->is_removing_locked(id)) {
+    if (st->stopping || !st->index.count(id) || st->is_removing_locked(id) || st->quarantined.count(id)) {
         return false;
     }
 
@@ -1713,39 +1705,13 @@ void server_cache_disk::touch(uint64_t id) {
     st->cv_jobs.notify_all();
 }
 
-void server_cache_disk::remove(uint64_t id) {
+void server_cache_disk::quarantine(uint64_t id) {
     std::unique_lock<std::mutex> lock(st->mtx);
 
-    if (st->stopping) {
-        return;
+    if (st->quarantined.insert(id).second) {
+        DSK_WRN("entry %s failed to restore, not offering it again (its file is kept)\n", hex64(id).c_str());
+        st->st.n_quarantined++;
     }
-
-    // a write of the entry not started yet is cancelled, one in progress removes its file when it is done
-    if (auto it = st->staged.find(id); it != st->staged.end()) {
-        st->staged_bytes -= it->second.job.n_bytes;
-        st->staged.erase(it);
-    }
-    if (st->cur_id == id) {
-        st->cur_removed = true;
-    }
-
-    if (!st->index.count(id)) {
-        return;
-    }
-
-    DSK_WRN("removing entry %s\n", hex64(id).c_str());
-
-    // an entry that is being loaded is removed by the reader when the load ends
-    std::vector<std::string> files;
-    st->remove_locked(id, files);
-    if (files.empty()) {
-        return;
-    }
-
-    st->ops.push_back({ file_op::REMOVE, id });
-
-    lock.unlock();
-    st->cv_jobs.notify_all();
 }
 
 void server_cache_disk::set_live(std::vector<llama_tokens> conversations) {

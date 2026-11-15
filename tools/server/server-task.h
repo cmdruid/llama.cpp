@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <cstdlib>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -794,6 +795,9 @@ struct server_prompt_cache {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
         this->n_swa        = n_swa;
+
+        // test only: every restore fails, as for a state that does not fit
+        this->test_restore_fail = getenv("LLAMA_SERVER_TEST_CACHE_RESTORE_FAIL") != nullptr;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -806,6 +810,8 @@ struct server_prompt_cache {
 
     // the SWA window of the context, 0 = none (see server_context_impl::n_swa)
     int32_t n_swa = 0;
+
+    bool test_restore_fail = false;
 
     size_t size() const;
 
@@ -863,7 +869,7 @@ struct server_prompt_cache {
     // add an entry read from disk, making room for it; false if it does not fit
     bool insert(server_prompt_cache_state && state);
 
-    // drop an entry, e.g. one that failed to restore
+    // drop an entry, e.g. one that failed to restore; the disk tier writes it first
     void erase(uint64_t id);
 
     bool contains(uint64_t id) const;

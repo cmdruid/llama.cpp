@@ -76,6 +76,7 @@ struct server_cache_disk_stats {
     uint64_t n_removed_evicted    = 0;
     uint64_t n_removed_superseded = 0;
     uint64_t n_removed_missing    = 0; // indexed, but the file is gone
+    uint64_t n_quarantined        = 0; // entries that failed to restore, not offered again until a restart
 
     uint64_t n_bytes_written = 0;
     uint64_t n_bytes_skipped = 0; // the size of the writes skipped because the entry left the RAM cache
@@ -144,8 +145,9 @@ struct server_cache_disk {
     // mark an entry as used now (LRU)
     void touch(uint64_t id);
 
-    // remove an entry that cannot be restored
-    void remove(uint64_t id);
+    // a restore of the entry failed: it is not offered again by this server, its file is kept
+    // (a failed restore does not prove that the entry is bad, e.g. it may not fit next to the other slots)
+    void quarantine(uint64_t id);
 
     // the conversations of the slots: the entries they continue are not evicted
     void set_live(std::vector<llama_tokens> conversations);

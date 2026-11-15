@@ -219,7 +219,7 @@ def test_damaged_entry_is_removed(damage):
 
 
 # an entry is only loaded by an engine with the same model and KV configuration
-@pytest.mark.parametrize("change", ["kv_type", "model"])
+@pytest.mark.parametrize("change", ["kv_type", "model", "override_kv"])
 def test_identity_key(change):
     global server
     server.start()
@@ -234,6 +234,8 @@ def test_identity_key(change):
 
     if change == "kv_type":
         server.ctk = "f32"
+    elif change == "override_kv":
+        server.override_kv = "test.cache.identity=int:1"
     else:
         # the same architecture and shapes, another file
         server.model_hf_repo = "ggml-org-dev/test-model-stories260K-infill"
@@ -828,3 +830,52 @@ def test_corrupt_entry_rewritten():
     log = LogReader(server.log_path)
     complete(LONG_PROMPT)
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
+
+
+# the key names the build and the resolved flash attention, not the requested one
+def test_identity_names_build_and_flash_attn():
+    global server
+    server.start()
+    [key_dir] = key_dirs()
+    identity = open(os.path.join(key_dir, "IDENTITY")).read()
+    assert "\nbuild: " in identity
+    assert "flash_attn on" in identity or "flash_attn off" in identity
+    assert "flash_attn -1" not in identity
+
+
+RESTORE_FAIL_ENV = "LLAMA_SERVER_TEST_CACHE_RESTORE_FAIL"
+
+
+# a restore that fails does not prove the entry bad: the request proceeds cold, the disk copy is kept and is not
+# offered again by this server; a later run restores it
+def test_restore_failure_keeps_disk_entry(monkeypatch):
+    global server
+    server.start()
+    complete(LONG_PROMPT)
+    restart()
+    [path] = entry_files()
+    server.stop()
+
+    monkeypatch.setenv(RESTORE_FAIL_ENV, "1")
+    server.start()
+    log = LogReader(server.log_path)
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert "failed to restore" in log.wait_for("failed to restore")
+    assert body["timings"]["cache_n"] == 0
+    assert path in entry_files()
+    st = cache_status()
+    assert st["disk"]["quarantined"] == 1
+    assert st["counters"]["failed_restores"] == 1
+
+    # not read again
+    log.drain()
+    complete(LONG_PROMPT + " The knight went home.")
+    assert "reading disk cache entry" not in log.drain()
+    server.stop()
+
+    monkeypatch.delenv(RESTORE_FAIL_ENV)
+    server.start()
+    log = LogReader(server.log_path)
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
+    assert body["timings"]["cache_n"] >= n_tokens(LONG_PROMPT)

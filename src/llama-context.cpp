@@ -4631,6 +4631,10 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+bool llama_flash_attn_enabled(const llama_context * ctx) {
+    return ctx->get_cparams().flash_attn;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
