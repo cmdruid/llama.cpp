@@ -879,3 +879,32 @@ def test_restore_failure_keeps_disk_entry(monkeypatch):
     body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
     assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
     assert body["timings"]["cache_n"] >= n_tokens(LONG_PROMPT)
+
+
+# temporary files at start-up: one of a process that is gone, or older than an hour (its pid may be reused), is
+# removed; one of a process that runs is kept and counted in the bound
+def test_stale_temporary_files():
+    global server
+    import subprocess
+    server.start()
+    server.stop()
+    [key_dir] = key_dirs()
+
+    p = subprocess.Popen(["true"])
+    p.wait()
+    gone = os.path.join(key_dir, f".0000000000000001.{p.pid}.tmp")
+    live = os.path.join(key_dir, f".0000000000000002.{os.getpid()}.tmp")
+    old  = os.path.join(key_dir, f".0000000000000003.{os.getpid()}.tmp")
+    for path in (gone, live, old):
+        with open(path, "wb") as f:
+            f.write(b"x" * 1000)
+    t = time.time() - 2*3600
+    os.utime(old, (t, t))
+
+    server.start()
+    assert not os.path.exists(gone)
+    assert not os.path.exists(old)
+    assert os.path.exists(live)
+    st = cache_status()["disk"]
+    assert st["bytes"] == 1000
+    assert st["other_entries"] == 1

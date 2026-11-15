@@ -2659,6 +2659,10 @@ control vectors and the speculative types (the key is written to `IDENTITY`). A 
 (one server process at a time: a second process with another key may remove the first one's files to stay within the
 bound, which costs it the entries but nothing else).
 Files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is removed, never loaded.
+At start-up a temporary file is removed if its process is gone, has the server's own pid or is older than an hour (a
+pid may be reused); the temporary file of a running process is kept and counted in the bound. A read or write that
+fails, for lack of memory as well, fails that entry only; the sizes in a file are checked against its length, and a
+file larger than the bound is never read.
 An entry whose file is gone (removed by hand, or with the directory) is dropped from the index when it is next read or
 touched, and the request waiting for it proceeds without it; a removed directory is created again by the next write.
 A state that fails to restore (for instance it does not fit beside the other slots) is not proof that the entry is bad:

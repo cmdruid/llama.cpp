@@ -294,6 +294,30 @@ size_t file_size_of(size_t n_tokens, size_t n_ckpt, size_t n_payload) {
     return DISK_HEADER_SIZE + n_tokens*sizeof(llama_token) + n_ckpt*DISK_CKPT_SIZE + n_payload + DISK_TRAILER_SIZE;
 }
 
+// a temporary file older than this is the rest of an interrupted write, whatever its process id says
+static constexpr int64_t DISK_TMP_MAX_AGE_S = 3600;
+
+#ifndef _WIN32
+// a temporary file of a write, ".<id>.<pid>.tmp": true if it is the rest of an interrupted write, i.e. its process is
+// gone, it has our pid (a previous process with the same pid: we have not written anything yet) or it is older than
+// DISK_TMP_MAX_AGE_S (the pid may have been reused)
+bool is_stale_tmp(const std::string & name, const struct stat & sb) {
+    const size_t p1 = name.find('.', 1);
+    const size_t p2 = name.rfind('.');
+    const long pid = p1 != std::string::npos && p2 > p1 ? atol(name.substr(p1 + 1, p2 - p1 - 1).c_str()) : 0;
+
+    if (pid <= 0 || pid == (long) getpid() || (kill((pid_t) pid, 0) != 0 && errno == ESRCH)) {
+        return true;
+    }
+
+    return time(nullptr) - sb.st_mtim.tv_sec > DISK_TMP_MAX_AGE_S;
+}
+
+bool is_tmp_name(const std::string & name) {
+    return name.size() > 4 && name[0] == '.' && name.compare(name.size() - 4, 4, ".tmp") == 0;
+}
+#endif
+
 } // namespace
 
 struct server_cache_disk::state {
@@ -323,9 +347,11 @@ struct server_cache_disk::state {
 
     // an entry of another key in the same directory root: counted in the bound and evicted like the entries of this
     // key, never loaded (a server with another key cannot use it)
+    // a temporary file of a write that may still be in progress is counted too, but never removed
     struct other_file {
         size_t  n_bytes = 0;
         int64_t t_used  = 0; // ns since epoch, the mtime
+        bool    pinned  = false;
     };
 
     // an entry to evict, of this key (id) or of another (path)
@@ -352,6 +378,7 @@ struct server_cache_disk::state {
     uint64_t                      cur_id    = 0; // the write in progress, 0 = none
     uint64_t                      cur_flush = 0;
     size_t                        cur_bytes = 0;
+    size_t                        cur_reserved = 0; // counted in n_bytes while its temporary file exists
     uint64_t                      flush_seq = 0;
     bool                          stopping   = false;
     bool                          writer_exited = false;
@@ -437,6 +464,24 @@ struct server_cache_disk::state {
         }
     }
 
+#ifndef _WIN32
+    // a temporary file found at start-up: removed if it is the rest of an interrupted write, counted otherwise
+    void scan_tmp(const std::string & path, std::vector<std::string> & files) {
+        struct stat sb;
+        if (stat(path.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) {
+            return;
+        }
+        const std::string name = std::filesystem::path(path).filename().string();
+        if (is_stale_tmp(name, sb)) {
+            DSK_WRN("removing interrupted write '%s'\n", path.c_str());
+            files.push_back(path);
+        } else {
+            DSK_WRN("keeping '%s', the write of another process that runs (counted in the bound)\n", path.c_str());
+            other_put(path, sb.st_size, (int64_t) sb.st_mtim.tv_sec*1000000000 + sb.st_mtim.tv_nsec, true);
+        }
+    }
+#endif
+
     // the file of an indexed entry is gone: forget the entry, unless it was replaced meanwhile
     void drop_missing_locked(uint64_t id, const entry_ptr & e) {
         auto it = index.find(id);
@@ -493,9 +538,9 @@ struct server_cache_disk::state {
         files.push_back(path_of(id));
     }
 
-    void other_put(const std::string & path, size_t n, int64_t t_used) {
+    void other_put(const std::string & path, size_t n, int64_t t_used, bool pinned = false) {
         other_erase(path);
-        others[path] = other_file { n, t_used };
+        others[path] = other_file { n, t_used, pinned };
         n_bytes        += n;
         n_bytes_others += n;
     }
@@ -529,7 +574,9 @@ struct server_cache_disk::state {
             order.push_back({ r.t_used, id, std::string(), r.e->n_bytes });
         }
         for (const auto & [path, f] : others) {
-            order.push_back({ f.t_used, 0, path, f.n_bytes });
+            if (!f.pinned) {
+                order.push_back({ f.t_used, 0, path, f.n_bytes });
+            }
         }
         std::sort(order.begin(), order.end(), [](const victim & a, const victim & b) { return a.t_used < b.t_used; });
 
@@ -741,7 +788,11 @@ struct server_cache_disk::state {
                 ok = r.get(c.n_tokens) && r.get(c.pos_min) && r.get(c.pos_max) && r.get(c.size_tgt) && r.get(c.size_dft) && r.get(c.size_spec);
                 ok = ok && c.size_tgt <= (uint64_t) sb.st_size && c.size_dft <= (uint64_t) sb.st_size && c.size_spec <= (uint64_t) sb.st_size;
                 if (ok) {
+                    // each term is at most the file size, the sum cannot overflow before it is checked
                     n_payload += c.size_tgt + c.size_dft + c.size_spec;
+                    ok = n_payload <= (uint64_t) sb.st_size;
+                }
+                if (ok) {
                     auto ckpt = std::make_shared<common_prompt_checkpoint>();
                     ckpt->id_task  = -1;
                     ckpt->n_tokens = c.n_tokens;
@@ -789,6 +840,14 @@ struct server_cache_disk::state {
                 break;
             }
 
+            // the sizes in the header are checked against the file length before anything is allocated: a file larger
+            // than the bound (e.g. a sparse file) is not read
+            if ((uint64_t) sb.st_size > n_bytes_max) {
+                DSK_WRN("entry %s is larger than the disk cache limit, not reading it\n", hex64(id).c_str());
+                corrupt = false;
+                break;
+            }
+
             uint8_t hdr[DISK_HEADER_SIZE];
             file_header h;
             if (!read_all(fd, hdr, sizeof(hdr), abort, nullptr) || !parse_header(hdr, sb.st_size, h) || h.id != id) {
@@ -822,6 +881,7 @@ struct server_cache_disk::state {
                     ok_meta = ok_meta && c.size_tgt <= (uint64_t) sb.st_size && c.size_dft <= (uint64_t) sb.st_size && c.size_spec <= (uint64_t) sb.st_size;
                     if (ok_meta) {
                         n_payload += c.size_tgt + c.size_dft + c.size_spec;
+                        ok_meta = n_payload <= (uint64_t) sb.st_size;
                     }
                 }
                 if (!ok_meta || file_size_of(h.n_tokens, h.n_ckpt, n_payload) != (size_t) sb.st_size) {
@@ -890,13 +950,7 @@ struct server_cache_disk::state {
         const std::string path = path_of(job.id);
         const std::string tmp  = dir + "/." + hex64(job.id) + "." + std::to_string(getpid()) + ".tmp";
 
-        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0) {
-            dir_missing = errno == ENOENT;
-            err = std::string("cannot create '") + tmp + "': " + strerror(errno);
-            return false;
-        }
-
+        // everything that allocates comes first: an exception leaves no temporary file behind
         size_t n_payload = job.data->main.size() + job.data->drft.size();
 
         byte_writer meta;
@@ -931,6 +985,13 @@ struct server_cache_disk::state {
             hdr.put<uint64_t>(hm.digest());
         }
         GGML_ASSERT(hdr.buf.size() == DISK_HEADER_SIZE);
+
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            dir_missing = errno == ENOENT;
+            err = std::string("cannot create '") + tmp + "': " + strerror(errno);
+            return false;
+        }
 
         xxh64 hp;
 
@@ -1029,7 +1090,8 @@ struct server_cache_disk::state {
             evict_locked(victims, files);
 
             // the temporary file counts while it is written
-            n_bytes += job.n_bytes;
+            n_bytes     += job.n_bytes;
+            cur_reserved = job.n_bytes;
         }
 
         unlink_files(files);
@@ -1054,7 +1116,8 @@ struct server_cache_disk::state {
 
         std::unique_lock<std::mutex> lock(mtx);
 
-        n_bytes -= job.n_bytes;
+        n_bytes     -= cur_reserved;
+        cur_reserved = 0;
 
         if (!ok) {
             if (!abort.load()) {
@@ -1141,6 +1204,26 @@ struct server_cache_disk::state {
         return res;
     }
 
+    void process_op(const file_op & op) {
+        switch (op.type) {
+            case file_op::TOUCH:
+                {
+#ifndef _WIN32
+                    // the mtime keeps the LRU order across restarts
+                    if (utimensat(AT_FDCWD, path_of(op.id).c_str(), nullptr, 0) != 0 && errno == ENOENT) {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        if (auto it = index.find(op.id); it != index.end()) {
+                            drop_missing_locked(op.id, it->second.e);
+                        }
+                    }
+#endif
+                } break;
+            case file_op::REMOVE:
+                unlink_files({ path_of(op.id) });
+                break;
+        }
+    }
+
     void writer_loop() {
         while (true) {
             std::unique_lock<std::mutex> lock(mtx);
@@ -1186,28 +1269,27 @@ struct server_cache_disk::state {
 
             lock.unlock();
 
-            if (has_op) {
-                switch (op.type) {
-                    case file_op::TOUCH:
-                        {
-#ifndef _WIN32
-                            // the mtime keeps the LRU order across restarts
-                            if (utimensat(AT_FDCWD, path_of(op.id).c_str(), nullptr, 0) != 0 && errno == ENOENT) {
-                                std::unique_lock<std::mutex> lock_st(mtx);
-                                if (auto it = index.find(op.id); it != index.end()) {
-                                    drop_missing_locked(op.id, it->second.e);
-                                }
-                            }
-#endif
-                        } break;
-                    case file_op::REMOVE:
-                        unlink_files({ path_of(op.id) });
-                        break;
+            // an exception (e.g. std::bad_alloc) fails the job, not the server
+            try {
+                if (has_op) {
+                    process_op(op);
+                } else {
+                    process_write(job);
                 }
-                continue;
+            } catch (const std::exception & e) {
+                const uint64_t id = has_op ? op.id : job.id;
+                DSK_ERR("failed to %s entry %s: %s\n", has_op ? "update" : "write", hex64(id).c_str(), e.what());
+
+                std::unique_lock<std::mutex> lock_st(mtx);
+                n_bytes     -= cur_reserved;
+                cur_reserved = 0;
+                st.n_write_errors++;
+                set_error_locked(std::string("cannot write entry ") + hex64(id) + ": " + e.what());
             }
 
-            process_write(job);
+            if (has_op) {
+                continue;
+            }
 
             // release the data before waking up the waiters
             job = write_job();
@@ -1249,9 +1331,17 @@ struct server_cache_disk::state {
 
             const int64_t t_start = ggml_time_us();
 
-            bool corrupt = false;
+            bool corrupt   = false;
+            bool exception = false; // e.g. std::bad_alloc: the entry may be fine, it stays indexed
 #ifndef _WIN32
-            res->ok = read_full(id, *res, corrupt);
+            try {
+                res->ok = read_full(id, *res, corrupt);
+            } catch (const std::exception & e) {
+                DSK_ERR("failed to read entry %s: %s\n", hex64(id).c_str(), e.what());
+                res = std::make_shared<loaded_entry>();
+                corrupt   = false;
+                exception = true;
+            }
 #endif
 
             if (t_test_read_delay_ms > 0) {
@@ -1294,6 +1384,8 @@ struct server_cache_disk::state {
                         set_error_locked("corrupt entry " + hex64(id));
                         st.n_removed_corrupt++;
                         remove = same;
+                    } else if (exception) {
+                        set_error_locked("cannot read entry " + hex64(id) + ": out of memory");
                     } else if (!abort.load()) {
                         // the file is missing or unreadable: forget the entry (a restart indexes it again if it is there),
                         // so that later requests do not wait for it again
@@ -1440,15 +1532,8 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     for (const auto & de : fs::directory_iterator(dir, ec)) {
         const std::string name = de.path().filename().string();
 
-        // a temporary file of a process that is gone is the rest of an interrupted write
-        if (name.size() > 4 && name[0] == '.' && name.compare(name.size() - 4, 4, ".tmp") == 0) {
-            const size_t p1 = name.find('.', 1);
-            const size_t p2 = name.rfind('.');
-            const long pid = p1 != std::string::npos && p2 > p1 ? atol(name.substr(p1 + 1, p2 - p1 - 1).c_str()) : 0;
-            if (pid <= 0 || (kill((pid_t) pid, 0) != 0 && errno == ESRCH)) {
-                DSK_WRN("removing interrupted write '%s'\n", name.c_str());
-                files.push_back(de.path().string());
-            }
+        if (is_tmp_name(name)) {
+            s.scan_tmp(de.path().string(), files);
             continue;
         }
 
@@ -1457,7 +1542,13 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
         }
 
         int64_t mtime_ns = 0;
-        auto e = s.read_entry(de.path().string(), mtime_ns);
+        entry_ptr e;
+        try {
+            e = s.read_entry(de.path().string(), mtime_ns);
+        } catch (const std::exception & ex) {
+            DSK_ERR("cannot index '%s': %s, skipping it\n", name.c_str(), ex.what());
+            continue;
+        }
         if (!e || hex64(e->id) + ".bin" != name) {
             DSK_WRN("removing invalid or truncated entry '%s'\n", name.c_str());
             s.st.n_removed_corrupt++;
@@ -1482,6 +1573,11 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
                 continue;
             }
             n_files++;
+
+            if (is_tmp_name(name)) {
+                s.scan_tmp(df.path().string(), files);
+                continue;
+            }
 
             struct stat sb;
             if (name.size() == 16 + 4 && name.compare(16, 4, ".bin") == 0 && stat(df.path().c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
