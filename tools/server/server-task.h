@@ -36,7 +36,6 @@ enum server_task_type {
     SERVER_TASK_TYPE_TTS,
     SERVER_TASK_TYPE_CACHE_LOADED, // a disk cache entry was read, see server-cache-disk.h
     SERVER_TASK_TYPE_CACHE_STATUS,
-    SERVER_TASK_TYPE_CACHE_PERSIST,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -673,9 +672,6 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_cache : server_task_result {
     json data;
-
-    // the disk writes queued by a persist, see server_cache_disk::wait()
-    uint64_t ticket = 0;
 
     virtual json to_json() override {
         return data;

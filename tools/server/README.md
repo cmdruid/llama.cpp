@@ -172,7 +172,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--cache-dir PATH` | directory of the disk tier of the prompt cache: cache entries are written there and reused after a restart<br/>entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DIR) |
 | `--cache-dir-max N` | size limit of --cache-dir in MiB, all keys together; least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
 | `--cache-dir-delay N` | maximum age in seconds of a conversation's progress not yet written to --cache-dir: a prompt cache entry is<br/>written once its oldest unwritten progress is this old, an idle slot is saved and written then too; an entry<br/>that a request continues before then is not written, one that the RAM cache drops is written first (default: 60, 0 = at once)<br/>(env: LLAMA_ARG_CACHE_DIR_DELAY) |
-| `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
+| `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, and before sleeping (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
@@ -1333,34 +1333,6 @@ loop waited for the writer, `backlog_timeouts` the waits that ran out (the write
 `writes_dropped` the entries dropped instead of written, of which `writes_dropped_stalled` without waiting for a stalled
 writer and `writes_dropped_nowait` while going to sleep. `bytes` counts every file under `DIR`,
 `other_entries`/`other_bytes` the part of it that belongs to other keys.
-
-### POST `/cache/persist`: Save the conversations of the slots to the prompt cache
-
-Saves the conversation of every non-empty slot to the prompt cache and, with `--cache-dir`, writes every entry not on
-disk yet, the most recently saved first, and waits until the disk writer is done (at most `--cache-persist-timeout`
-seconds). A slot that is processing a task is saved as it
-stands between two decoding steps (counted in `n_busy`); the task is not interrupted. A gateway calls this before it
-stops the server; the server does the same on a graceful shutdown (SIGTERM), and before it goes to sleep (there without
-waiting: the writer finishes in the background while the server sleeps).
-
-**Response format**
-
-```json
-{
-    "n_saved": 1,
-    "n_cached": 0,
-    "n_failed": 0,
-    "n_busy": 0,
-    "n_bytes": 3611820032,
-    "save_ms": 1850.2,
-    "disk": true,
-    "flushed": true,
-    "total_ms": 3402
-}
-```
-
-`n_cached` counts slots whose conversation was already in the cache, `n_failed` slots that could not be saved (a state
-larger than `--cache-ram`). `flushed` is false if the writer did not finish in time.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
@@ -2675,7 +2647,7 @@ earlier prompt cache:
 - with a unified KV cache, a restore that fails for lack of cells is retried after saving and clearing the other idle
   slots, and an idle slot is saved before it is purged; an entry that still fails to restore without other slots
   holding cells is dropped from RAM;
-- `GET /cache`, `POST /cache/persist` (which saves the slots to RAM) and the `prompt_cache_*` metrics are new.
+- `GET /cache` and the `prompt_cache_*` metrics are new.
 
 **Disk tier.** Entries are stored in `DIR/<arch>-<hash>/`, where the hash covers everything that shapes a saved state:
 the build (number and commit: an upgraded server starts cold), the model and draft model files (size and hashes of their
@@ -2741,7 +2713,7 @@ not written when it is saved to RAM, but when one of these happens first:
   hung disk stops the server loop once, not at every eviction. Going to sleep never waits: such an entry is dropped
   (`writes_dropped_nowait`). With write-ahead these waits and drops are rare: they need entries dropped from RAM
   faster than the writer writes them;
-- `POST /cache/persist`, a graceful shutdown or going to sleep: everything not written yet is written, the most
+- a graceful shutdown (SIGTERM) or going to sleep: everything not written yet is written, the most
   recently saved first (after the entries the RAM cache dropped or is about to drop), within `--cache-persist-timeout`
   (going to sleep does not wait for it).
 

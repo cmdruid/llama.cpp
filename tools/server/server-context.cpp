@@ -3703,23 +3703,6 @@ private:
                     res->data = cache_status();
                     queue_results.send(std::move(res));
                 } break;
-            case SERVER_TASK_TYPE_CACHE_PERSIST:
-                {
-                    const auto pr = cache_persist();
-
-                    auto res = std::make_unique<server_task_result_cache>();
-                    res->id     = task.id;
-                    res->ticket = pr.ticket;
-                    res->data   = {
-                        {"n_saved",   pr.n_saved},
-                        {"n_cached",  pr.n_cached},
-                        {"n_failed",  pr.n_failed},
-                        {"n_busy",    pr.n_busy},
-                        {"n_bytes",   pr.n_bytes},
-                        {"save_ms",   pr.t_ms},
-                    };
-                    queue_results.send(std::move(res));
-                } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
                     cache_disk_cancel(task.id_target);
@@ -6579,60 +6562,6 @@ void server_routes::init_routes() {
         }
 
         res->ok(result->to_json());
-        return res;
-    };
-
-    this->post_cache_persist = [this](const server_http_req & req) {
-        auto res = create_response(true);
-
-        const int64_t t_start = ggml_time_ms();
-
-        json data = {
-            {"n_saved", 0}, {"n_cached", 0}, {"n_failed", 0}, {"n_busy", 0}, {"n_bytes", 0}, {"save_ms", 0.0},
-        };
-        uint64_t ticket = 0;
-
-        // sleeping: the slots were persisted when the server went to sleep
-        if (!queue_tasks.is_sleeping()) {
-            {
-                server_task task(SERVER_TASK_TYPE_CACHE_PERSIST);
-                task.id = res->rd.get_new_id();
-                res->rd.post_task(std::move(task), true); // high-priority task
-            }
-
-            auto result = res->rd.next([&]{
-                return req.should_stop() || queue_tasks.is_sleeping();
-            });
-            if (!result) {
-                if (!req.should_stop()) {
-                    res->error(format_error_response("the server went to sleep, retry", ERROR_TYPE_UNAVAILABLE));
-                }
-                return res;
-            }
-
-            if (result->is_error()) {
-                res->error(result->to_json());
-                return res;
-            }
-
-            auto * res_task = dynamic_cast<server_task_result_cache *>(result.get());
-            GGML_ASSERT(res_task != nullptr);
-
-            data   = res_task->data;
-            ticket = res_task->ticket;
-        }
-
-        // wait for the writer here, not in the server loop
-        bool flushed = true;
-        if (auto * disk = ctx_server.get_cache_disk()) {
-            flushed = disk->wait(ticket, (int64_t) params.cache_persist_timeout*1000);
-        }
-
-        data["disk"]     = ctx_server.get_cache_disk() != nullptr;
-        data["flushed"]  = flushed;
-        data["total_ms"] = ggml_time_ms() - t_start;
-
-        res->ok(data);
         return res;
     };
 

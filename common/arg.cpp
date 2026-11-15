@@ -1732,7 +1732,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_DIR_DELAY").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-persist-timeout"}, "N",
-        string_format("seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: %d)", params.cache_persist_timeout),
+        string_format("seconds to wait for the slots to be written to --cache-dir at shutdown and before sleeping (default: %d)", params.cache_persist_timeout),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("cache-persist-timeout must be non-negative");
