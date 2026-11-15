@@ -30,7 +30,9 @@
 // - <id> is a hash of the entry's tokens: an entry present both in RAM and on disk is one entry
 // - files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is detected by its
 //   exact length and checksums, removed and never loaded
-// - the directory is bounded by size, least recently used first (file mtime), the entries of live slots are kept
+// - the directory root is bounded by size as a whole: the entries of other keys found at start-up are counted and
+//   evicted with the others, least recently used first (file mtime); the entries of live slots are kept, and a write
+//   that would exceed the bound because of them is skipped (the entry stays in RAM)
 // - an entry superseded or removed while it is being read is removed when the read ends: the read completes and the
 //   request waiting for it gets the state
 //
@@ -50,9 +52,12 @@ bool server_cache_disk_text_tokens(const server_tokens & tokens, llama_tokens & 
 std::string server_cache_disk_file_identity(const std::string & path);
 
 struct server_cache_disk_stats {
-    size_t n_entries = 0;
-    size_t n_bytes   = 0;
+    size_t n_entries = 0;   // of this key
+    size_t n_bytes   = 0;   // all files under the directory root, counted in the bound
     size_t n_bytes_max = 0;
+
+    size_t n_entries_other = 0; // the entries of other keys under the directory root
+    size_t n_bytes_other   = 0;
 
     size_t n_backlog       = 0; // entries not written yet: waiting for their delay, queued or in progress
     size_t n_backlog_bytes = 0;

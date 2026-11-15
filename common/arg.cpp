@@ -1710,7 +1710,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-dir-max"}, "N",
-        string_format("size limit of the disk tier of the prompt cache in MiB, least recently used entries are removed first (default: %d)", params.cache_dir_max_mib),
+        string_format("size limit of --cache-dir in MiB, all keys together; least recently used entries are removed first (default: %d)", params.cache_dir_max_mib),
         [](common_params & params, int value) {
             if (value <= 0) {
                 throw std::invalid_argument("cache-dir-max must be positive");

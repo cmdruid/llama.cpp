@@ -1033,6 +1033,8 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"entries",         st.n_entries},
         {"bytes",           st.n_bytes},
         {"limit_bytes",     st.n_bytes_max},
+        {"other_entries",   st.n_entries_other},
+        {"other_bytes",     st.n_bytes_other},
         {"delay_s",         st.t_delay_ms / 1000.0},
         {"backlog_entries", st.n_backlog},
         {"backlog_bytes",   st.n_backlog_bytes},

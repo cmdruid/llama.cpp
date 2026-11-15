@@ -320,9 +320,26 @@ struct server_cache_disk::state {
         bool      removing = false; // superseded or removed while it is loaded: removed when the load ends
     };
 
+    // an entry of another key in the same directory root: counted in the bound and evicted like the entries of this
+    // key, never loaded (a server with another key cannot use it)
+    struct other_file {
+        size_t  n_bytes = 0;
+        int64_t t_used  = 0; // ns since epoch, the mtime
+    };
+
+    // an entry to evict, of this key (id) or of another (path)
+    struct victim {
+        int64_t     t_used  = 0;
+        uint64_t    id      = 0;
+        std::string path;
+        size_t      n_bytes = 0;
+    };
+
     // guarded by mtx
     std::map<uint64_t, record>    index;
-    size_t                        n_bytes = 0; // sum of the indexed file sizes
+    std::map<std::string, other_file> others;  // path -> file
+    size_t                        n_bytes = 0; // all files: the indexed entries, the others and the write in progress
+    size_t                        n_bytes_others = 0;
     std::vector<llama_tokens>     live;        // the conversations of the slots
     std::set<uint64_t>            loading;     // reads requested or in progress
     std::deque<uint64_t>          load_queue;
@@ -344,6 +361,8 @@ struct server_cache_disk::state {
 
     // held while on_loaded() runs, so that stop() can wait for a callback in progress
     std::mutex mtx_callback;
+
+    std::string dir_root;
 
     std::string path_of(uint64_t id) const {
         return dir + "/" + hex64(id) + ".bin";
@@ -394,29 +413,68 @@ struct server_cache_disk::state {
         files.push_back(path_of(id));
     }
 
-    // the oldest entries that are neither live nor loading, until n_needed more bytes fit
-    // caller holds mtx, the files are removed by the caller without the lock
-    void evict_locked(size_t n_needed, std::vector<std::string> & files) {
-        if (n_bytes + n_needed <= n_bytes_max) {
+    void other_put(const std::string & path, size_t n, int64_t t_used) {
+        other_erase(path);
+        others[path] = other_file { n, t_used };
+        n_bytes        += n;
+        n_bytes_others += n;
+    }
+
+    void other_erase(const std::string & path) {
+        auto it = others.find(path);
+        if (it == others.end()) {
             return;
         }
+        n_bytes        -= it->second.n_bytes;
+        n_bytes_others -= it->second.n_bytes;
+        others.erase(it);
+    }
 
-        std::vector<std::pair<int64_t, uint64_t>> order;
+    // the oldest entries of any key that are neither live, loading, being removed nor in `keep`, until n_needed more
+    // bytes fit once n_freed bytes are released; false if they cannot be made to fit
+    // nothing is removed, see evict_locked()
+    bool plan_evict_locked(size_t n_needed, size_t n_freed, const std::vector<uint64_t> & keep, std::vector<victim> & out) const {
+        out.clear();
+
+        size_t n_cur = n_bytes - std::min(n_bytes, n_freed);
+        if (n_cur + n_needed <= n_bytes_max) {
+            return true;
+        }
+
+        std::vector<victim> order;
         for (const auto & [id, r] : index) {
-            if (r.removing || loading.count(id) || is_live_locked(*r.e)) {
+            if (r.removing || loading.count(id) || std::find(keep.begin(), keep.end(), id) != keep.end() || is_live_locked(*r.e)) {
                 continue;
             }
-            order.emplace_back(r.t_used, id);
+            order.push_back({ r.t_used, id, std::string(), r.e->n_bytes });
         }
-        std::sort(order.begin(), order.end());
+        for (const auto & [path, f] : others) {
+            order.push_back({ f.t_used, 0, path, f.n_bytes });
+        }
+        std::sort(order.begin(), order.end(), [](const victim & a, const victim & b) { return a.t_used < b.t_used; });
 
-        for (const auto & [t, id] : order) {
-            if (n_bytes + n_needed <= n_bytes_max) {
+        for (auto & v : order) {
+            if (n_cur + n_needed <= n_bytes_max) {
                 break;
             }
-            const auto & e = *index.at(id).e;
-            DSK_INF("evicting entry %s (%zu tokens, %.3f MiB)\n", hex64(id).c_str(), e.prompt.tokens.size(), e.n_bytes / (1024.0 * 1024.0));
-            remove_locked(id, files);
+            n_cur -= std::min(n_cur, v.n_bytes);
+            out.push_back(std::move(v));
+        }
+
+        return n_cur + n_needed <= n_bytes_max;
+    }
+
+    // caller holds mtx, the files are removed by the caller without the lock
+    void evict_locked(const std::vector<victim> & victims, std::vector<std::string> & files) {
+        for (const auto & v : victims) {
+            if (v.path.empty()) {
+                DSK_INF("evicting entry %s (%d tokens, %.3f MiB)\n", hex64(v.id).c_str(), index.at(v.id).e->prompt.n_tokens(), v.n_bytes / (1024.0 * 1024.0));
+                remove_locked(v.id, files);
+            } else {
+                DSK_INF("evicting entry '%s' of another key (%.3f MiB)\n", v.path.c_str(), v.n_bytes / (1024.0 * 1024.0));
+                other_erase(v.path);
+                files.push_back(v.path);
+            }
             st.n_removed_evicted++;
         }
     }
@@ -437,14 +495,45 @@ struct server_cache_disk::state {
         st.last_error = msg;
     }
 
-    static void unlink_files(const std::vector<std::string> & files) {
+    // remove the files, and the directories of other keys that they leave empty
+    void unlink_files(const std::vector<std::string> & files) const {
+        std::set<std::string> dirs;
         for (const auto & f : files) {
             std::error_code ec;
             std::filesystem::remove(f, ec);
             if (ec) {
                 DSK_WRN("failed to remove '%s': %s\n", f.c_str(), ec.message().c_str());
             }
+            const std::string parent = std::filesystem::path(f).parent_path().string();
+            if (parent != dir) {
+                dirs.insert(parent);
+            }
         }
+        for (const auto & d : dirs) {
+            remove_stale_key_dir(d);
+        }
+    }
+
+    // a key directory without entries: only its IDENTITY is left
+    static bool remove_stale_key_dir(const std::string & path) {
+        namespace fs = std::filesystem;
+
+        std::error_code ec;
+        for (const auto & de : fs::directory_iterator(path, ec)) {
+            if (de.path().filename() != "IDENTITY") {
+                return false;
+            }
+        }
+        if (ec) {
+            return false;
+        }
+
+        fs::remove(fs::path(path) / "IDENTITY", ec);
+        if (!fs::remove(path, ec) || ec) {
+            return false;
+        }
+        DSK_INF("removed the empty cache directory '%s'\n", path.c_str());
+        return true;
     }
 
     // parse and validate the header and the meta section; meta receives the meta bytes
@@ -833,8 +922,31 @@ struct server_cache_disk::state {
                 return;
             }
 
-            // make room first, so that the directory stays within its bound
-            evict_locked(job.n_bytes, files);
+            // the entries that the new one continues are removed once it is written: they make room first
+            // (they stay on disk during the write, in case it fails)
+            const server_tokens tokens(job.tokens, false);
+            std::vector<uint64_t> superseded;
+            size_t n_freed = 0;
+            for (const auto & [id, r] : index) {
+                if (!r.removing && r.e->prompt.is_continued_by(tokens)) {
+                    superseded.push_back(id);
+                    n_freed += loading.count(id) ? 0 : r.e->n_bytes;
+                }
+            }
+
+            // then the least recently used entries; if the entries that are kept (live or being read) leave no room,
+            // the write is skipped and the entry stays in RAM
+            std::vector<victim> victims;
+            if (!plan_evict_locked(job.n_bytes, n_freed, superseded, victims)) {
+                DSK_WRN("no room for entry %s (%.3f MiB): the live entries fill the disk cache limit (%.3f of %.3f MiB), skipping\n",
+                        hex64(job.id).c_str(), job.n_bytes / (1024.0 * 1024.0), n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0));
+                st.n_write_no_room++;
+                return;
+            }
+            evict_locked(victims, files);
+
+            // the temporary file counts while it is written
+            n_bytes += job.n_bytes;
         }
 
         unlink_files(files);
@@ -848,6 +960,8 @@ struct server_cache_disk::state {
         const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
         std::unique_lock<std::mutex> lock(mtx);
+
+        n_bytes -= job.n_bytes;
 
         if (!ok) {
             if (!abort.load()) {
@@ -1251,14 +1365,44 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
         s.index_put(std::move(e), mtime_ns);
     }
 
+    // the entries of the other keys in the directory root count in the same bound
+    s.dir_root = dir_root;
+    for (const auto & de : fs::directory_iterator(dir_root, ec)) {
+        if (!de.is_directory() || de.path().filename() == fs::path(dir).filename() || !fs::exists(de.path() / "IDENTITY")) {
+            continue;
+        }
+
+        size_t n_files = 0;
+        for (const auto & df : fs::directory_iterator(de.path(), ec)) {
+            const std::string name = df.path().filename().string();
+            if (name == "IDENTITY") {
+                continue;
+            }
+            n_files++;
+
+            struct stat sb;
+            if (name.size() == 16 + 4 && name.compare(16, 4, ".bin") == 0 && stat(df.path().c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
+                s.other_put(df.path().string(), sb.st_size, (int64_t) sb.st_mtim.tv_sec*1000000000 + sb.st_mtim.tv_nsec);
+            }
+        }
+
+        if (n_files == 0) {
+            state::remove_stale_key_dir(de.path().string());
+        }
+    }
+
     // the bound may be lower than in the previous run
-    s.evict_locked(0, files);
+    {
+        std::vector<state::victim> victims;
+        s.plan_evict_locked(0, 0, {}, victims);
+        s.evict_locked(victims, files);
+    }
 
-    state::unlink_files(files);
+    s.unlink_files(files);
 
-    DSK_INF("disk prompt cache in '%s': %zu entries, %.3f MiB (limit %.3f MiB), write delay %.1f s, indexed in %.2f ms\n",
-            dir.c_str(), s.index.size(), s.n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0), t_delay_ms / 1000.0,
-            (ggml_time_us() - t_start) / 1000.0);
+    DSK_INF("disk prompt cache in '%s': %zu entries, %.3f MiB, other keys %zu entries, %.3f MiB (limit %.3f MiB), write delay %.1f s, indexed in %.2f ms\n",
+            dir.c_str(), s.index.size(), (s.n_bytes - s.n_bytes_others) / (1024.0 * 1024.0), s.others.size(), s.n_bytes_others / (1024.0 * 1024.0),
+            n_bytes_max / (1024.0 * 1024.0), t_delay_ms / 1000.0, (ggml_time_us() - t_start) / 1000.0);
 
     auto sp = res->st;
     s.writer = std::thread([sp]() { sp->writer_loop(); });
@@ -1560,6 +1704,8 @@ server_cache_disk_stats server_cache_disk::stats() const {
 
     server_cache_disk_stats res = st->st;
     res.n_entries       = st->index.size();
+    res.n_entries_other = st->others.size();
+    res.n_bytes_other   = st->n_bytes_others;
     res.n_bytes         = st->n_bytes;
     res.n_bytes_max     = st->n_bytes_max;
     res.n_backlog       = st->staged.size() + (st->cur_id != 0 ? 1 : 0);

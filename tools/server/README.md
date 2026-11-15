@@ -170,7 +170,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--cache-dir PATH` | directory of the disk tier of the prompt cache: cache entries are written there and reused after a restart<br/>entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DIR) |
-| `--cache-dir-max N` | size limit of the disk tier of the prompt cache in MiB, least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
+| `--cache-dir-max N` | size limit of --cache-dir in MiB, all keys together; least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
 | `--cache-dir-delay N` | seconds a prompt cache entry stays in RAM unwritten before it is written to --cache-dir; an entry that a request<br/>continues before then is not written, one that the RAM cache drops is written first (default: 60, 0 = at once)<br/>(env: LLAMA_ARG_CACHE_DIR_DELAY) |
 | `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -1262,7 +1262,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:prompt_cache_misses_total` | Counter | Requests for which neither the slot nor the cache had anything to reuse. |
 | `llamacpp:prompt_cache_evictions_total` | Counter | Entries dropped from RAM to fit `--cache-ram` (they remain on disk with `--cache-dir`). |
 | `llamacpp:prompt_cache_ram_entries`, `llamacpp:prompt_cache_ram_bytes` | Gauge | Entries and bytes in the RAM tier. |
-| `llamacpp:prompt_cache_disk_entries`, `llamacpp:prompt_cache_disk_bytes`, `llamacpp:prompt_cache_disk_backlog_bytes` | Gauge | Entries and bytes in the disk tier, bytes waiting to be written (only with `--cache-dir`). |
+| `llamacpp:prompt_cache_disk_entries`, `llamacpp:prompt_cache_disk_bytes`, `llamacpp:prompt_cache_disk_backlog_bytes` | Gauge | Entries of this server's key in the disk tier, bytes of all keys under `--cache-dir` (the bounded size), bytes waiting to be written (only with `--cache-dir`). |
 | `llamacpp:prompt_cache_disk_writes_total`, `llamacpp:prompt_cache_disk_errors_total`, `llamacpp:prompt_cache_disk_evictions_total` | Counter | Disk tier writes, failed writes and reads, entries removed to fit `--cache-dir-max` (only with `--cache-dir`). |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
@@ -1326,7 +1326,8 @@ reported (`"sleeping": true`). Contains no prompt content.
 The disk writer's counters show the write-behind at work: `backlog_entries`/`backlog_bytes` are the entries not
 written yet (waiting for their `delay_s`, queued or in progress), `writes`/`bytes_written` the entries written,
 `writes_skipped`/`bytes_skipped` the entries a request continued before their delay expired (never written),
-`writes_present` the entries that were already on disk and `writes_no_room` the entries larger than the bound.
+`writes_present` the entries that were already on disk and `writes_no_room` the entries for which the bound left no
+room. `bytes` counts every file under `DIR`, `other_entries`/`other_bytes` the part of it that belongs to other keys.
 
 ### POST `/cache/persist`: Save the conversations of the slots to the prompt cache
 
@@ -2653,13 +2654,21 @@ assistant turns after it may be rendered differently when the client sends them 
 **Disk tier.** Entries are stored in `DIR/<arch>-<hash>/`, where the hash covers everything that shapes a saved state:
 the model and draft model files (size and hashes of their first and last MiB), the context size per sequence, unified
 KV, the K/V types, flash attention, SWA, RoPE settings, LoRA adapters, control vectors and the speculative types (the
-key is written to `IDENTITY`). A state is only loaded by a server with the same key; several keys can share `DIR`.
+key is written to `IDENTITY`). A state is only loaded by a server with the same key; several keys can share `DIR`
+(one server process at a time: a second process with another key may remove the first one's files to stay within the
+bound, which costs it the entries but nothing else).
 Files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is removed, never loaded.
 At start-up only the headers and tokens are read. A request that a disk entry serves better than RAM waits while the
 entry is read in the background (other requests are not blocked), then it is restored as from RAM; the disk copy is
 kept. An entry superseded by a newer one while it is being read is removed when the read ends; the waiting request
-still gets its state. The directory is bounded by `--cache-dir-max`, least recently used first; the entries of live
-conversations are not evicted. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
+still gets its state.
+
+**Bound.** `--cache-dir-max` bounds `DIR` as a whole, across keys: at start-up the server also counts the entries of the
+other keys (from their sizes and mtimes) and evicts them like its own, least recently used first, so a stale key (after
+a model update or a context change) gives its space back; a key directory left without entries is removed. When a
+conversation grows, the entry it replaces makes room first. The entries of live conversations and those being read are
+not evicted; if they leave no room for a new entry, its write is skipped (`writes_no_room`) and it stays in RAM. During
+a write, the entries it supersedes stay on disk until it completes. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
 
 **Write-behind.** An entry is not written when it is saved to RAM, but when one of these happens first:
 - it has stayed in the RAM cache unwritten for `--cache-dir-delay` seconds (default 60; 0 writes it at once);

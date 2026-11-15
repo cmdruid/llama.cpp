@@ -620,3 +620,126 @@ def test_disk_copy_kept_until_continuation_written():
     assert res.status_code == 200 and res.body["flushed"]
     assert path not in entry_files()
     assert cache_status()["disk"]["removed_superseded"] == 1
+
+
+def key_dirs():
+    return sorted(os.path.dirname(p) for p in glob.glob(os.path.join(server.cache_dir, "*", "IDENTITY")))
+
+
+def persist():
+    res = server.make_request("POST", "/cache/persist")
+    assert res.status_code == 200 and res.body["flushed"]
+    return res.body
+
+
+# --cache-dir-max bounds the directory as a whole: the entries of another key are counted and evicted, least recently
+# used first, and the key directory they leave empty is removed
+def test_bound_counts_other_keys():
+    global server
+    server.start()
+    for i in range(2):
+        complete(conversation(i, 4))
+        persist()
+    server.stop()
+    assert len(entry_files()) == 2
+    [dir_old] = key_dirs()
+
+    # another key: f32 K and V, about twice the size per entry
+    server.ctk = "f32"
+    server.ctv = "f32"
+    server.cache_dir_max = 2
+    server.start()
+
+    st = cache_status()["disk"]
+    assert st["entries"] == 0
+    assert st["other_entries"] == 2
+    assert st["bytes"] == sum(os.path.getsize(p) for p in entry_files())
+
+    complete(conversation(2, 4))
+    persist()
+    assert cache_status()["disk"]["other_entries"] == 2
+
+    # no room for a second entry of this key without the entries of the other key
+    complete(conversation(3, 4))
+    persist()
+    st = cache_status()["disk"]
+    assert st["other_entries"] == 0
+    assert st["entries"] == 2
+    assert st["removed_evicted"] == 2
+    assert st["bytes"] <= st["limit_bytes"]
+    assert dir_old not in key_dirs()
+    assert not os.path.exists(dir_old)
+
+
+# a key directory without entries is removed at start-up, a directory that is not a key directory is left alone
+def test_empty_key_dir_removed():
+    global server
+    stale = os.path.join(server.cache_dir, "llama-0123456789abcdef")
+    other = os.path.join(server.cache_dir, "notes")
+    os.makedirs(stale)
+    os.makedirs(other)
+    with open(os.path.join(stale, "IDENTITY"), "w") as f:
+        f.write("stale\n")
+    with open(os.path.join(other, "README"), "w") as f:
+        f.write("keep\n")
+
+    server.start()
+    assert not os.path.exists(stale)
+    assert os.path.exists(os.path.join(other, "README"))
+
+
+# the entry that a growing conversation replaces makes room first: an unrelated entry is not evicted for it
+def test_superseded_entry_makes_room():
+    global server
+    server.cache_dir_max = 1 # MiB
+    server.start()
+
+    unrelated = conversation(1, 4)
+    grown = conversation(0, 2)
+    complete(unrelated)
+    persist()
+    complete(grown)
+    persist()
+    assert len(entry_files()) == 2
+    path_unrelated = min(entry_files(), key=os.path.getmtime)
+
+    # the conversation grows: the new entry does not fit beside both, but it replaces the old one
+    complete(grown + " " + LONG_PROMPT + " " + LONG_PROMPT)
+    persist()
+    st = cache_status()["disk"]
+    assert st["removed_superseded"] == 1
+    assert st["removed_evicted"] == 0
+    assert path_unrelated in entry_files()
+    assert st["bytes"] <= st["limit_bytes"]
+
+
+# when the live entries leave no room, a write is skipped and counted, the entry stays in RAM, the bound holds
+def test_no_room_skips_write():
+    global server
+    server.n_slots = 2
+    server.n_ctx = 4096
+    server.cache_dir_max = 1 # MiB
+    server.start()
+
+    live = conversation(0, 5)
+    complete(live, id_slot=0)
+    persist()
+    assert len(entry_files()) == 1
+
+    other = conversation(1, 5)
+    complete(other, id_slot=1)
+    complete(OTHER_PROMPT, id_slot=1) # `other` goes to RAM and is written at once (delay 0)
+
+    st = wait_disk("writes_no_room", 1)
+    assert st["writes"] == 1
+    assert st["bytes"] <= st["limit_bytes"]
+    assert len(entry_files()) == 1
+
+    # still in RAM: restored without a disk read
+    log = LogReader(server.log_path)
+    log.drain()
+    body = complete(other + " The end.", id_slot=1)
+    out = log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
+    assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in out
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" not in out
+    assert body["timings"]["cache_n"] >= n_tokens(other) - 1
