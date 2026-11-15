@@ -527,7 +527,8 @@ def test_resumed_before_delay_is_not_written():
     assert entry_files() == []
 
 
-# write-behind: an entry is written once it has stayed in RAM for the delay
+# write-behind: an entry is written once its progress is as old as the delay; so is the live slot, saved to the cache
+# while the server is idle
 def test_written_after_delay():
     global server
     server.cache_dir_delay = 2
@@ -541,7 +542,8 @@ def test_written_after_delay():
 
     wait_disk("writes", 1)
     assert time.time() - t0 > 1.5
-    assert len(entry_files()) == 1
+    wait_disk("writes", 2)
+    assert len(entry_files()) == 2
     assert cache_status()["disk"]["backlog_entries"] == 0
 
 
@@ -556,10 +558,12 @@ def test_ram_eviction_writes():
         complete(conversation(i, 4))
     complete(OTHER_PROMPT)
 
-    # the two oldest left RAM, the others wait for their delay
-    st = wait_disk("writes", 2)
-    assert st["writes"] == 2
-    assert st["backlog_entries"] == 2
+    # the two oldest left RAM and are written; the two oldest of those in RAM are written ahead of their delay (the RAM
+    # cache is above its high-water mark), the newest one waits for its delay
+    st = wait_disk("writes", 4)
+    assert st["writes"] == 4
+    assert st["writes_ahead"] == 4
+    assert st["backlog_entries"] == 0
     assert cache_status()["counters"]["evictions_ram"] == 2
 
     # they are read back from disk
@@ -635,6 +639,9 @@ def test_disk_copy_kept_until_continuation_written():
     assert cache_status()["disk"]["removed_superseded"] == 1
 
 
+IDENTITY_FORMAT = "format: llama-server prompt cache 1, llama state seq 1\n"
+
+
 def key_dirs():
     return sorted(os.path.dirname(p) for p in glob.glob(os.path.join(server.cache_dir, "*", "IDENTITY")))
 
@@ -692,7 +699,7 @@ def test_empty_key_dir_removed():
     os.makedirs(stale)
     os.makedirs(other)
     with open(os.path.join(stale, "IDENTITY"), "w") as f:
-        f.write("stale\n")
+        f.write(IDENTITY_FORMAT + "stale\n")
     with open(os.path.join(other, "README"), "w") as f:
         f.write("keep\n")
 
@@ -1096,3 +1103,355 @@ def test_shutdown_while_loading(monkeypatch):
     out = open(server.log_path, errors="replace").read()
     assert "persist before shutdown" in out
     assert "detaching them" not in out
+
+
+# the last use of an entry is never in the future: entries whose files have future mtimes (the clock was stepped back,
+# the files were restored) are evicted like the others, they do not wedge a full directory
+@pytest.mark.parametrize("offset", [86400, -86400])
+def test_future_mtime_does_not_wedge_bound(offset):
+    global server
+    server.cache_dir_max = 1 # MiB, about two of these conversations
+    server.start()
+    for i in range(2):
+        complete(conversation(10 + i, 4))
+        persist()
+    server.stop()
+    old = entry_files()
+    assert len(old) == 2
+    t = time.time() + offset
+    for path in old:
+        os.utime(path, (t, t))
+
+    server.start()
+    for i in range(3):
+        complete(conversation(i, 4))
+        persist()
+    st = cache_status()["disk"]
+    assert st["writes_no_room"] == 0
+    assert st["writes"] == 3
+    assert st["removed_evicted"] == 3
+    assert not any(path in entry_files() for path in old)
+    assert st["bytes"] <= st["limit_bytes"]
+    # the files are written with their last use as mtime, never in the future
+    assert all(os.path.getmtime(path) <= time.time() + 1 for path in entry_files())
+
+
+# no token generated: the next turn continues the saved entry exactly
+def complete0(prompt, **kwargs):
+    return complete(prompt, n_predict=0, **kwargs)
+
+
+def grow(prompt):
+    return prompt + " The knight rode on."
+
+
+# --cache-dir-delay is the maximum age of unwritten progress: a conversation that is continued again and again before
+# its delay inherits the age of the entry it continues, so it is written within the delay of its first unwritten turn
+# (it used to get a fresh delay with every save and was never written while in use)
+def test_active_conversation_written_within_delay():
+    global server
+    server.cache_dir_delay = 3
+    server.start()
+
+    convs = [conversation(1), conversation(2)]
+    t0 = time.time()
+    t_first = None
+    # one slot: each turn saves the other conversation to the cache and continues this one from it
+    while time.time() - t0 < 8:
+        for i in range(2):
+            convs[i] = grow(convs[i])
+            complete0(convs[i])
+        if t_first is None and cache_status()["disk"]["writes"] > 0:
+            t_first = time.time() - t0
+        time.sleep(0.2)
+    st = cache_status()["disk"]
+    assert t_first is not None, st
+    assert 2.0 < t_first < 5.0, t_first
+    assert st["writes"] >= 2
+    assert st["writes_skipped"] > 0
+
+
+# a conversation that stays in its slot has no cache entry: once its progress is as old as the delay, the idle slot is
+# saved to the cache and written, and it survives a crash; the slot keeps it
+def test_idle_slot_written_after_delay():
+    global server
+    server.cache_dir_delay = 2
+    server.start()
+    log = LogReader(server.log_path)
+
+    n_long = n_tokens(LONG_PROMPT)
+    complete(LONG_PROMPT)
+    assert entry_files() == []
+    assert "__TEST_TAG_CACHE_STALE_SLOT__" in log.wait_for("__TEST_TAG_CACHE_STALE_SLOT__", timeout=6)
+    st = wait_disk("writes", 1)
+    assert len(entry_files()) == 1
+
+    # the slot still holds the conversation; nothing new to save
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert body["timings"]["cache_n"] >= n_long
+    assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" not in log.drain()
+
+    kill()
+    server.start()
+    log = LogReader(server.log_path)
+    body = complete(LONG_PROMPT + " The knight went home.")
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
+    assert body["timings"]["cache_n"] >= n_long
+
+
+READ_THROW_ENV = "LLAMA_SERVER_TEST_CACHE_DISK_READ_THROW"
+
+
+# a read that fails (std::bad_alloc injected) of an entry superseded during the read: the entry is still removed when
+# the read ends, it does not stay in the index (counted in the bound, never offered nor evicted)
+def test_failed_read_of_superseded_entry_is_removed(monkeypatch):
+    global server
+    server.start()
+    complete(LONG_PROMPT)
+    restart()
+    [path_long] = entry_files()
+    server.stop()
+
+    monkeypatch.setenv(READ_DELAY_ENV, "3000")
+    monkeypatch.setenv(READ_THROW_ENV, "1")
+    server.start()
+    log = LogReader(server.log_path)
+
+    a = Background(complete, LONG_PROMPT + " A")
+    assert "reading disk cache entry" in log.wait_for("reading disk cache entry")
+    complete(LONG_PROMPT + " B", cache_prompt=False)
+    persist() # supersedes the entry being read
+    assert path_long in entry_files()
+
+    a.join()
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" not in log.drain()
+    assert "out of memory" in cache_status()["disk"]["last_error"]
+    t0 = time.time()
+    while path_long in entry_files():
+        assert time.time() - t0 < 5, entry_files()
+        time.sleep(0.05)
+    st = cache_status()["disk"]
+    assert st["removed_superseded"] == 1
+    assert st["entries"] == 1
+    assert st["bytes"] == sum(os.path.getsize(p) for p in entry_files())
+
+
+WRITE_DELAY_ENV_ = "LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS"
+
+
+# the removal of an entry superseded while it was read applies to that record only: the same entry written again while
+# the read ended keeps its new file
+def test_remove_applies_to_its_record(monkeypatch):
+    global server
+    server.cache_dir_delay = 60
+    server.cache_ram = 1 # MiB
+    server.start()
+    complete0(LONG_PROMPT)
+    restart()
+    [path_x] = entry_files()
+    server.stop()
+
+    monkeypatch.setenv(READ_DELAY_ENV, "5500")
+    monkeypatch.setenv(WRITE_DELAY_ENV_, "3000")
+    server.start()
+    log = LogReader(server.log_path)
+
+    # A waits for the read of X
+    a = Background(complete, LONG_PROMPT + " A")
+    assert "reading disk cache entry" in log.wait_for("reading disk cache entry")
+
+    # B supersedes X while it is read (written after 3 s)
+    complete0(LONG_PROMPT + " B", cache_prompt=False)
+    persist()
+    # B leaves RAM: a request continues it from RAM, and that conversation is too large for the RAM cache
+    complete0(OTHER_PROMPT, cache_prompt=False)
+    complete0(LONG_PROMPT + " B " + " ".join([LONG_PROMPT] * 9))
+    assert cache_status()["ram"]["entries"] == 1 # OTHER
+    # the slot holds the tokens of X again: X is written again (after 3 s), the read of X ends meanwhile
+    complete0(LONG_PROMPT, cache_prompt=False)
+    persist()
+    a.join()
+
+    assert path_x in entry_files()
+    st = cache_status()["disk"]
+    assert st["entries"] == len(entry_files())
+
+    restart()
+    log = LogReader(server.log_path)
+    complete0(LONG_PROMPT + " C")
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
+
+
+# a hung disk: the server loop waits for the writer once (--cache-persist-timeout), then drops the entries the RAM cache
+# evicts without waiting until the writer finishes a write
+def test_stalled_writer_drops_without_waiting(monkeypatch):
+    global server
+    monkeypatch.setenv(WRITE_DELAY_ENV_, "20000")
+    server.cache_dir_delay = 60
+    server.cache_ram = 1 # MiB, about two of these conversations
+    server.cache_persist_timeout = 1
+    server.start()
+
+    t0 = time.time()
+    for i in range(6):
+        complete(conversation(i, 4))
+    complete(OTHER_PROMPT)
+    elapsed = time.time() - t0
+
+    st = cache_status()["disk"]
+    assert st["backlog_timeouts"] == 1, st
+    assert st["backlog_waits"] == 1, st
+    assert st["writes_dropped_stalled"] >= 2, st
+    assert st["writes_dropped"] == st["writes_dropped_stalled"] + 1, st
+    assert st["backlog_wait_ms"] < 2000, st
+    assert elapsed < 10, elapsed
+
+
+# only what this software writes is counted or removed: a directory whose IDENTITY is not a key's, a symbolic link to a
+# key directory, and files that are not named as entries or temporary files are left alone
+def test_foreign_files_left_alone(tmp_path):
+    global server
+    root = server.cache_dir
+    big = b"x" * (2 * 1024 * 1024)
+
+    def write(path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+
+    notes = os.path.join(root, "notes")
+    write(os.path.join(notes, "IDENTITY"), b"my notes\n")
+    write(os.path.join(notes, "0123456789abcdef.bin"), big)
+
+    key = os.path.join(root, "llama-00000000000000aa")
+    write(os.path.join(key, "IDENTITY"), IDENTITY_FORMAT.encode())
+    foreign = [os.path.join(key, n) for n in ("zzzzzzzzzzzzzzzz.bin", ".foo.tmp", ".0123456789abcdef.x.tmp", "0123456789ABCDEF.bin")]
+    for path in foreign:
+        write(path, big)
+    ours = os.path.join(key, "00000000000000ab.bin")
+    write(ours, big)
+
+    outside = str(tmp_path / "outside")
+    write(os.path.join(outside, "IDENTITY"), IDENTITY_FORMAT.encode())
+    write(os.path.join(outside, "00000000000000ac.bin"), big)
+    link = os.path.join(root, "llama-00000000000000ad")
+    os.symlink(outside, link)
+
+    server.cache_dir_max = 1 # MiB: the entry of the other key does not fit, it is evicted
+    server.start()
+
+    st = cache_status()["disk"]
+    assert st["other_entries"] == 0
+    assert st["removed_evicted"] == 1
+    assert not os.path.exists(ours)
+    for path in foreign + [os.path.join(notes, "0123456789abcdef.bin"), os.path.join(outside, "00000000000000ac.bin")]:
+        assert os.path.exists(path), path
+    assert os.path.islink(link)
+    assert os.path.isdir(key) # it holds files that are not ours
+
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT)
+    wait_disk("writes", 1)
+    assert os.path.exists(os.path.join(notes, "0123456789abcdef.bin"))
+
+
+# the key names the draft context's resolved flash attention
+def test_identity_names_draft_flash_attn(tmp_path):
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.model_draft = download_file("https://huggingface.co/ggml-org-dev/tiny-llamas/resolve/main/stories15M-q4_0.gguf")
+    server.spec_type = "draft-simple"
+    server.fa = "off"
+    server.cache_ram = 100
+    server.cache_dir = str(tmp_path / "cache")
+    server.start()
+    [key_dir] = key_dirs()
+    identity = open(os.path.join(key_dir, "IDENTITY")).read()
+    [draft] = [l for l in identity.splitlines() if l.startswith("draft context:")]
+    assert "flash_attn off" in draft
+
+
+# an entry saved to RAM again while it is on disk gets its file touched, so that a restart keeps the order of use
+def test_resave_of_entry_on_disk_touches_it():
+    global server
+    server.start()
+
+    complete0(LONG_PROMPT)
+    complete0(OTHER_PROMPT) # LONG is written
+    st = wait_disk("writes", 1)
+    [path] = entry_files()
+    complete0(LONG_PROMPT) # continued from RAM: it leaves RAM for the slot, its file is touched
+    time.sleep(0.2)
+    t1 = os.path.getmtime(path)
+    time.sleep(1.5)
+    n_present = cache_status()["disk"]["writes_present"]
+    complete0(OTHER_PROMPT) # saved again: already on disk
+    t0 = time.time()
+    while os.path.getmtime(path) < t1 + 1.0:
+        assert time.time() - t0 < 5, (os.path.getmtime(path), t1)
+        time.sleep(0.05)
+    assert cache_status()["disk"]["writes_present"] == n_present + 1
+
+
+# a RAM hit while an entry waits for its delay counts as a use: the file is written with it as its mtime
+def test_ram_hit_before_write_is_its_last_use():
+    global server
+    server.cache_dir_delay = 60
+    server.start()
+
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT) # LONG waits in RAM for its delay
+    t_saved = time.time()
+    time.sleep(2)
+    # a branch off LONG: the entry stays in RAM, used now
+    body = complete(LONG_PROMPT[:200] + " and then the dragon spoke.")
+    assert body["timings"]["cache_n"] > 0
+    t_hit = time.time()
+    persist()
+    path = max(entry_files(), key=os.path.getsize)
+    assert os.path.getmtime(path) >= t_saved + 1.5
+    assert os.path.getmtime(path) <= t_hit + 0.5
+
+
+# write-ahead: above 80 % of --cache-ram the least recently used entries are written before their delay, so that an
+# eviction finds them on disk instead of waiting for the writer (it used to wait for the previous eviction's write)
+def test_write_ahead_avoids_backlog_wait(monkeypatch):
+    global server
+    monkeypatch.setenv(WRITE_DELAY_ENV_, "1500")
+    server.cache_dir_delay = 60
+    server.cache_ram = 1 # MiB
+    server.start()
+
+    complete(conversation(0, 4))
+    complete(conversation(1, 4))
+    complete(conversation(2, 6)) # 0 and 1 are in RAM, above the mark: both are written ahead
+    time.sleep(4)
+    complete(OTHER_PROMPT) # 2 is saved: 0 and 1 leave RAM at once
+    st = cache_status()["disk"]
+    assert st["backlog_waits"] == 0, st
+    assert st["writes_ahead"] >= 2, st
+    assert st["writes_dropped"] == 0, st
+
+
+# going to sleep never waits for the writer with the task queue locked: an entry that would need a wait is dropped
+def test_sleep_never_waits_for_writer(monkeypatch):
+    global server
+    monkeypatch.setenv(WRITE_DELAY_ENV_, "4000")
+    server.cache_dir_delay = 60
+    server.cache_ram = 1 # MiB
+    server.sleep_idle_seconds = 1
+    server.start()
+    log = LogReader(server.log_path)
+
+    for i in range(4):
+        complete(conversation(i, 4))
+    out = log.wait_for("server is entering sleeping state", timeout=10)
+    assert "server is entering sleeping state" in out
+    t0 = time.time()
+    st = cache_status()
+    assert time.time() - t0 < 1.0
+    out += log.wait_for("persist before sleep")
+    assert "persist before sleep" in out
+    st = cache_status()
+    assert st["sleeping"] is True
+    assert st["disk"]["writes_dropped_nowait"] == 1, st["disk"]

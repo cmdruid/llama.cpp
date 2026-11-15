@@ -1804,13 +1804,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // the oldest unwritten progress of the new entry: the slot's, and that of the entries it replaces
+    int64_t t_unwritten_ms = prompt.t_unwritten_ms;
+
     // remove any cached prompts that the current prompt continues - their conversation is contained in it
     for (auto it = states.begin(); it != states.end();) {
         if (it->prompt.is_continued_by(prompt.tokens)) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", it->prompt.n_tokens());
 
             if (disk) {
-                disk->drop(it->id);
+                if (const int64_t t = disk->drop(it->id); t > 0) {
+                    t_unwritten_ms = t_unwritten_ms > 0 ? std::min(t_unwritten_ms, t) : t;
+                }
             }
 
             it = states.erase(it);
@@ -1853,6 +1858,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
             /*.n_protected =*/ prompt.n_protected,
+            /*.t_unwritten_ms =*/ t_unwritten_ms,
         },
         /*.data    =*/ std::make_shared<server_prompt_data>(server_prompt_data {
             /*.main =*/ std::move(state_data_tgt),
@@ -2004,11 +2010,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best->prompt.is_continued_by(tokens_new)) {
         // the slot continues this conversation and will be saved again before it is truncated, so the entry is not needed
         // (a copy on disk stays until the slot's conversation is written and supersedes it)
-        if (disk) {
-            disk->drop(it_best->id);
-        }
+        // the slot inherits the age of the entry's unwritten progress: an active conversation is written by its deadline
+        const int64_t t_unwritten_ms = disk ? disk->drop(it_best->id) : 0;
 
         prompt = std::move(it_best->prompt);
+        prompt.t_unwritten_ms = t_unwritten_ms;
 
         states.erase(it_best);
     } else {
@@ -2030,6 +2036,34 @@ void server_prompt_cache::on_saved(const server_prompt_cache_state & state) {
     if (disk) {
         disk->stage(state);
     }
+
+    write_ahead();
+}
+
+void server_prompt_cache::write_ahead() const {
+    if (!disk || limit_size == 0) {
+        return;
+    }
+
+    const size_t n_cur  = size();
+    const size_t n_mark = (size_t) (WRITE_AHEAD_MARK*limit_size);
+    if (n_cur <= n_mark) {
+        return;
+    }
+
+    std::vector<uint64_t> ids;
+    size_t n_freed = 0;
+    for (const auto & state : states) {
+        if (ids.size() >= 2 && n_cur - n_freed <= n_mark) {
+            break;
+        }
+        if (state.id != 0) {
+            ids.push_back(state.id);
+        }
+        n_freed += state.size();
+    }
+
+    disk->write_ahead(ids);
 }
 
 void server_prompt_cache::evict_oldest() {
@@ -2108,6 +2142,8 @@ bool server_prompt_cache::insert(server_prompt_cache_state && state) {
     states.push_back(std::move(state));
     stats.n_hits_disk++;
 
+    write_ahead();
+
     return true;
 }
 
@@ -2158,4 +2194,6 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+
+    write_ahead();
 }

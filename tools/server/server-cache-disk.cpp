@@ -144,6 +144,16 @@ int64_t time_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// a last use is never in the future: a file's mtime may be (the clock was stepped back, the file was restored), and an
+// entry that looks used later than everything written now would never be evicted
+int64_t clamp_now(int64_t t_ns) {
+    return std::min(t_ns, time_now_ns());
+}
+
+// the start of this process (as the library is loaded), to tell a temporary file of a previous process with the same
+// pid from one created since, see is_stale_tmp()
+const int64_t t_process_start_ns = time_now_ns();
+
 } // namespace
 
 uint64_t server_cache_disk_hash(const void * data, size_t size, uint64_t seed) {
@@ -261,8 +271,8 @@ struct write_job {
 
     size_t n_bytes = 0; // the size of the file
 
-    // the last use of the entry (ns since epoch): its save to the RAM cache, not the time of the write, so that the
-    // LRU order does not depend on the order of the writes; the file gets it as its mtime
+    // the last use of the entry (ns since epoch): its last save to the RAM cache or restore from it, not the time of
+    // the write, so that the LRU order does not depend on the order of the writes; the file gets it as its mtime
     int64_t t_used = 0;
 };
 
@@ -270,17 +280,20 @@ struct write_job {
 struct staged_write {
     write_job job;
 
-    int64_t  t_staged_ms = 0;
-    int64_t  t_due_ms    = 0;
-    uint64_t flush       = 0;     // the flush that wants it written, 0 = none
-    bool     released    = false; // the RAM cache dropped the entry: the writer holds its only copy
+    int64_t  t_staged_ms   = 0;
+    int64_t  t_progress_ms = 0;     // the oldest progress of the conversation that is not on disk
+    int64_t  t_due_ms      = 0;     // t_progress_ms + the delay
+    uint64_t flush         = 0;     // the flush that wants it written, 0 = none
+    bool     released      = false; // the RAM cache dropped the entry: the writer holds its only copy
+    bool     ahead         = false; // the RAM cache is about to drop the entry: write it now, see write_ahead()
 };
 
 // a small file operation of the writer, done in order before the writes
 struct file_op {
     enum type_t { TOUCH, REMOVE } type = TOUCH;
 
-    uint64_t id = 0;
+    uint64_t id  = 0;
+    uint64_t gen = 0; // REMOVE: the generation of the record it removes, see state::record
 };
 
 struct loaded_entry {
@@ -301,24 +314,86 @@ size_t file_size_of(size_t n_tokens, size_t n_ckpt, size_t n_payload) {
 // a temporary file older than this is the rest of an interrupted write, whatever its process id says
 static constexpr int64_t DISK_TMP_MAX_AGE_S = 3600;
 
-#ifndef _WIN32
-// a temporary file of a write, ".<id>.<pid>.tmp": true if it is the rest of an interrupted write, i.e. its process is
-// gone, it has our pid (a previous process with the same pid: we have not written anything yet) or it is older than
-// DISK_TMP_MAX_AGE_S (the pid may have been reused)
-bool is_stale_tmp(const std::string & name, const struct stat & sb) {
-    const size_t p1 = name.find('.', 1);
-    const size_t p2 = name.rfind('.');
-    const long pid = p1 != std::string::npos && p2 > p1 ? atol(name.substr(p1 + 1, p2 - p1 - 1).c_str()) : 0;
+// the first line of IDENTITY: a directory is a key directory only if its IDENTITY starts with it
+static const char * DISK_FORMAT_LINE = "format: llama-server prompt cache ";
 
-    if (pid <= 0 || pid == (long) getpid() || (kill((pid_t) pid, 0) != 0 && errno == ESRCH)) {
+bool is_hex16(const std::string & s, size_t pos) {
+    if (s.size() < pos + 16) {
+        return false;
+    }
+    for (size_t i = pos; i < pos + 16; ++i) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the name of an entry: "<16 hex digits>.bin", as written by write_file()
+bool is_entry_name(const std::string & name) {
+    return name.size() == 16 + 4 && is_hex16(name, 0) && name.compare(16, 4, ".bin") == 0;
+}
+
+// the name of the temporary file of a write: ".<16 hex digits>.<pid>.tmp", as written by write_file()
+bool parse_tmp_name(const std::string & name, long & pid) {
+    if (name.size() < 1 + 16 + 1 + 1 + 4 || name[0] != '.' || !is_hex16(name, 1) || name[17] != '.' ||
+        name.compare(name.size() - 4, 4, ".tmp") != 0) {
+        return false;
+    }
+    const std::string digits = name.substr(18, name.size() - 4 - 18);
+    if (digits.empty() || digits.size() > 9 || !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        return false;
+    }
+    pid = atol(digits.c_str());
+    return pid > 0;
+}
+
+#ifndef _WIN32
+int64_t mtime_ns_of(const struct stat & sb) {
+    return (int64_t) sb.st_mtim.tv_sec*1000000000 + sb.st_mtim.tv_nsec;
+}
+
+// a temporary file of a write with process id `pid`: true if it is the rest of an interrupted write, i.e. its process
+// is gone, it has our pid and was created before this process started (a previous process with the same pid; one
+// created since is another server's, e.g. in another pid namespace), or it is older than DISK_TMP_MAX_AGE_S (the pid
+// may have been reused)
+bool is_stale_tmp(long pid, const struct stat & sb) {
+    if (pid == (long) getpid()) {
+        if (mtime_ns_of(sb) < t_process_start_ns) {
+            return true;
+        }
+    } else if (kill((pid_t) pid, 0) != 0 && errno == ESRCH) {
         return true;
     }
 
     return time(nullptr) - sb.st_mtim.tv_sec > DISK_TMP_MAX_AGE_S;
 }
 
-bool is_tmp_name(const std::string & name) {
-    return name.size() > 4 && name[0] == '.' && name.compare(name.size() - 4, 4, ".tmp") == 0;
+// a directory (not a symbolic link) whose IDENTITY (a regular file) starts with the format line
+bool is_key_dir(const std::string & path) {
+    struct stat sb;
+    if (lstat(path.c_str(), &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+        return false;
+    }
+    const std::string identity = path + "/IDENTITY";
+    if (lstat(identity.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        return false;
+    }
+    const int fd = ::open(identity.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return false;
+    }
+    const size_t n = strlen(DISK_FORMAT_LINE);
+    std::string buf(n, '\0');
+    const ssize_t r = ::read(fd, buf.data(), n);
+    ::close(fd);
+    return r == (ssize_t) n && buf == DISK_FORMAT_LINE;
+}
+
+// lstat: a symbolic link is never followed
+bool lstat_regular(const std::string & path, struct stat & sb) {
+    return lstat(path.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
 }
 #endif
 
@@ -343,6 +418,9 @@ struct server_cache_disk::state {
     // test only: every write fails with this errno once its header is written (env LLAMA_SERVER_TEST_CACHE_DISK_WRITE_ERRNO)
     int test_write_errno = 0;
 
+    // test only: every read fails with std::bad_alloc (env LLAMA_SERVER_TEST_CACHE_DISK_READ_THROW)
+    bool test_read_throw = false;
+
     mutable std::mutex mtx;
     mutable std::condition_variable cv_jobs;   // writer and reader wait for work
     mutable std::condition_variable cv_done;   // wait() and stop() wait for progress
@@ -351,8 +429,9 @@ struct server_cache_disk::state {
     // the index is only changed by index_put(), index_touch() and index_erase(), so that it and the LRU order agree
     struct record {
         entry_ptr e;
-        int64_t   t_used   = 0;     // ns since epoch
+        int64_t   t_used   = 0;     // ns since epoch, never in the future, see clamp_now()
         bool      removing = false; // superseded or removed while it is loaded: removed when the load ends
+        uint64_t  gen      = 0;     // a new record of the same id (a new write of the entry) has a new generation
     };
 
     // an entry of another key in the same directory root: counted in the bound and evicted like the entries of this
@@ -392,6 +471,11 @@ struct server_cache_disk::state {
     size_t                        cur_reserved = 0; // counted in n_bytes while its temporary file exists
     bool                          cur_released = false;
     uint64_t                      flush_seq = 0;
+    uint64_t                      gen_seq   = 0;
+    uint64_t                      n_progress = 0;     // writes the writer finished (written or failed)
+    bool                          stalled    = false; // release() timed out waiting for the writer ...
+    uint64_t                      stalled_at = 0;     // ... when n_progress was this
+    bool                          wait_allowed = true; // see set_wait_allowed()
     bool                          stopping   = false;
     bool                          writer_exited = false;
     bool                          reader_exited = false;
@@ -477,19 +561,19 @@ struct server_cache_disk::state {
     }
 
 #ifndef _WIN32
-    // a temporary file found at start-up: removed if it is the rest of an interrupted write, counted otherwise
-    void scan_tmp(const std::string & path, std::vector<std::string> & files) {
+    // a temporary file of a write (by its name, see parse_tmp_name()) found at start-up: removed if it is the rest of an
+    // interrupted write, counted otherwise; anything but a regular file is left alone
+    void scan_tmp(const std::string & path, long pid, std::vector<std::string> & files) {
         struct stat sb;
-        if (stat(path.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        if (!lstat_regular(path, sb)) {
             return;
         }
-        const std::string name = std::filesystem::path(path).filename().string();
-        if (is_stale_tmp(name, sb)) {
+        if (is_stale_tmp(pid, sb)) {
             DSK_WRN("removing interrupted write '%s'\n", path.c_str());
             files.push_back(path);
         } else {
             DSK_WRN("keeping '%s', the write of another process that runs (counted in the bound)\n", path.c_str());
-            other_put(path, sb.st_size, (int64_t) sb.st_mtim.tv_sec*1000000000 + sb.st_mtim.tv_nsec, true);
+            other_put(path, sb.st_size, clamp_now(mtime_ns_of(sb)), true);
         }
     }
 #endif
@@ -509,13 +593,23 @@ struct server_cache_disk::state {
         const uint64_t id = e->id;
         index_erase(id);
         n_bytes += e->n_bytes;
-        index[id] = record { std::move(e), t_used, false };
+        index[id] = record { std::move(e), clamp_now(t_used), false, ++gen_seq };
     }
 
     void index_touch(uint64_t id, int64_t t_used) {
         if (auto it = index.find(id); it != index.end()) {
-            it->second.t_used = t_used;
+            it->second.t_used = clamp_now(t_used);
         }
+    }
+
+    // update the mtime of the entry's file, coalesced: one pending update per entry
+    void queue_touch_locked(uint64_t id) {
+        for (const auto & op : ops) {
+            if (op.type == file_op::TOUCH && op.id == id) {
+                return;
+            }
+        }
+        ops.push_back({ file_op::TOUCH, id, 0 });
     }
 
     // returns false if the entry is not indexed
@@ -567,16 +661,28 @@ struct server_cache_disk::state {
         others.erase(it);
     }
 
-    // the oldest entries of any key that are neither live, loading, being removed nor in `keep`, and were used before
-    // t_before, until n_needed more bytes fit once n_freed bytes are released; false if they cannot be made to fit
-    // (an entry to write evicts only entries used less recently than itself: otherwise it is the one to drop)
+    // the oldest entries of any key that are neither live, loading, being removed nor in `keep`, and were used at or
+    // before t_before, until n_needed more bytes fit once n_freed bytes are released; false if they cannot be made to
+    // fit (an entry to write evicts only entries used less recently than itself: otherwise it is the one to drop)
+    // the last uses are first clamped to now: an entry that looks used in the future (the clock was stepped back) is
+    // from then on as recent as the present, so an entry saved after this call can evict it, and so can one saved
+    // before it whose last use is clamped to the same instant (a tie is evictable)
     // nothing is removed, see evict_locked()
-    bool plan_evict_locked(size_t n_needed, size_t n_freed, const std::vector<uint64_t> & keep, int64_t t_before, std::vector<victim> & out) const {
+    bool plan_evict_locked(size_t n_needed, size_t n_freed, const std::vector<uint64_t> & keep, int64_t t_before, std::vector<victim> & out) {
         out.clear();
 
         size_t n_cur = n_bytes - std::min(n_bytes, n_freed);
         if (n_cur + n_needed <= n_bytes_max) {
             return true;
+        }
+
+        const int64_t t_now = time_now_ns();
+        t_before = std::min(t_before, t_now);
+        for (auto & [id, r] : index) {
+            r.t_used = std::min(r.t_used, t_now);
+        }
+        for (auto & [path, f] : others) {
+            f.t_used = std::min(f.t_used, t_now);
         }
 
         std::vector<victim> order;
@@ -594,7 +700,7 @@ struct server_cache_disk::state {
         std::sort(order.begin(), order.end(), [](const victim & a, const victim & b) { return a.t_used < b.t_used; });
 
         for (auto & v : order) {
-            if (n_cur + n_needed <= n_bytes_max || v.t_used >= t_before) {
+            if (n_cur + n_needed <= n_bytes_max || v.t_used > t_before) {
                 break;
             }
             n_cur -= std::min(n_cur, v.n_bytes);
@@ -655,8 +761,15 @@ struct server_cache_disk::state {
     }
 
     // a key directory without entries: only its IDENTITY is left
+    // a directory that is not a key directory (see is_key_dir()) or a symbolic link is never removed
     static bool remove_stale_key_dir(const std::string & path) {
         namespace fs = std::filesystem;
+
+#ifndef _WIN32
+        if (!is_key_dir(path)) {
+            return false;
+        }
+#endif
 
         std::error_code ec;
         for (const auto & de : fs::directory_iterator(path, ec)) {
@@ -750,7 +863,7 @@ struct server_cache_disk::state {
     // read the header and the meta section of a file, validate them and build the index entry
     // returns nullptr if the file is not a valid entry of this key
     entry_ptr read_entry(const std::string & path, int64_t & mtime_ns) const {
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0) {
             return nullptr;
         }
@@ -762,7 +875,7 @@ struct server_cache_disk::state {
             if (fstat(fd, &sb) != 0) {
                 break;
             }
-            mtime_ns = (int64_t) sb.st_mtim.tv_sec*1000000000 + sb.st_mtim.tv_nsec;
+            mtime_ns = clamp_now(mtime_ns_of(sb));
 
             uint8_t hdr[DISK_HEADER_SIZE];
             file_header h;
@@ -834,7 +947,7 @@ struct server_cache_disk::state {
         corrupt = false;
 
         const std::string path = path_of(id);
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0) {
             return false;
         }
@@ -1079,9 +1192,12 @@ struct server_cache_disk::state {
         {
             std::unique_lock<std::mutex> lock(mtx);
 
+            // the file's mtime is the last use, never in the future
+            job.t_used = clamp_now(job.t_used);
+
             if (index.count(job.id) && !index.at(job.id).removing) {
-                index_touch(job.id, time_now_ns());
-                ops.push_back({ file_op::TOUCH, job.id });
+                index_touch(job.id, job.t_used);
+                queue_touch_locked(job.id);
                 st.n_write_present++;
                 return;
             }
@@ -1126,8 +1242,9 @@ struct server_cache_disk::state {
 
         const int64_t t_start = ggml_time_us();
 
-        if (t_test_write_delay_ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(t_test_write_delay_ms));
+        // a hung disk, interrupted by an abort like a write
+        for (int64_t t = 0; t < t_test_write_delay_ms && !abort.load(); t += 10) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         std::string err;
@@ -1205,13 +1322,16 @@ struct server_cache_disk::state {
 #endif
     }
 
-    // the next write to do: one that the RAM cache released first (it holds memory the RAM cache no longer counts),
-    // then the most recently saved entry, so that a deadline loses the least valuable ones
+    // the next write to do: one that the RAM cache released first (it holds memory the RAM cache no longer counts), the
+    // oldest first; then one that the RAM cache is about to release (write-ahead), the oldest first; then the most
+    // recently saved entry, so that a deadline loses the least valuable ones
     std::map<uint64_t, staged_write>::iterator pick_locked(int64_t t_now) {
+        const auto rank = [](const staged_write & w) { return w.released ? 0 : (w.ahead ? 1 : 2); };
+
         auto res = staged.end();
         for (auto it = staged.begin(); it != staged.end(); ++it) {
             const auto & w = it->second;
-            if (!(stopping || w.released || w.flush != 0 || w.t_due_ms <= t_now)) {
+            if (!(stopping || w.released || w.ahead || w.flush != 0 || w.t_due_ms <= t_now)) {
                 continue;
             }
             if (res == staged.end()) {
@@ -1219,7 +1339,9 @@ struct server_cache_disk::state {
                 continue;
             }
             const auto & b = res->second;
-            if (w.released != b.released ? w.released : (w.released ? w.t_staged_ms < b.t_staged_ms : w.t_staged_ms > b.t_staged_ms)) {
+            const int rw = rank(w);
+            const int rb = rank(b);
+            if (rw != rb ? rw < rb : (rw < 2 ? w.t_staged_ms < b.t_staged_ms : w.t_staged_ms > b.t_staged_ms)) {
                 res = it;
             }
         }
@@ -1241,7 +1363,11 @@ struct server_cache_disk::state {
                 {
 #ifndef _WIN32
                     // the mtime keeps the LRU order across restarts
-                    if (utimensat(AT_FDCWD, path_of(op.id).c_str(), nullptr, 0) != 0 && errno == ENOENT) {
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        st.n_touches++;
+                    }
+                    if (utimensat(AT_FDCWD, path_of(op.id).c_str(), nullptr, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT) {
                         std::unique_lock<std::mutex> lock(mtx);
                         if (auto it = index.find(op.id); it != index.end()) {
                             drop_missing_locked(op.id, it->second.e);
@@ -1250,8 +1376,18 @@ struct server_cache_disk::state {
 #endif
                 } break;
             case file_op::REMOVE:
-                unlink_files({ path_of(op.id) });
-                break;
+                {
+                    // the removal applies to the record it was issued for: a newer write of the same entry (renamed into
+                    // place since) keeps its file; ops and writes are done by this thread, so no write is in progress
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        if (auto it = index.find(op.id); it != index.end() && it->second.gen != op.gen) {
+                            DSK_DBG("entry %s was written again, keeping its file\n", hex64(op.id).c_str());
+                            break;
+                        }
+                    }
+                    unlink_files({ path_of(op.id) });
+                } break;
         }
     }
 
@@ -1275,6 +1411,9 @@ struct server_cache_disk::state {
                 }
                 const int64_t t_now = ggml_time_ms();
                 if (auto it = pick_locked(t_now); it != staged.end()) {
+                    if (it->second.ahead && !it->second.released && it->second.flush == 0 && !stopping && it->second.t_due_ms > t_now) {
+                        st.n_write_ahead++;
+                    }
                     job = std::move(it->second.job);
                     cur_id      = it->first;
                     cur_flush   = it->second.flush;
@@ -1331,6 +1470,7 @@ struct server_cache_disk::state {
             cur_flush    = 0;
             cur_bytes    = 0;
             cur_released = false;
+            n_progress++;
             lock.unlock();
 
             cv_done.notify_all();
@@ -1368,6 +1508,9 @@ struct server_cache_disk::state {
             bool exception = false; // e.g. std::bad_alloc: the entry may be fine, it stays indexed
 #ifndef _WIN32
             try {
+                if (test_read_throw) {
+                    throw std::bad_alloc();
+                }
                 res->ok = read_full(id, *res, corrupt);
             } catch (const std::exception & e) {
                 DSK_ERR("failed to read entry %s: %s\n", hex64(id).c_str(), e.what());
@@ -1396,7 +1539,10 @@ struct server_cache_disk::state {
 
                 // the files are removed and touched by the writer, in order with the writes of the same entry
                 std::vector<std::string> files;
-                bool remove = false;
+
+                // the load is over, whatever its outcome: an entry superseded or removed meanwhile goes now
+                bool remove = same && it->second.removing;
+                const uint64_t gen = same ? it->second.gen : 0;
 
                 if (res->ok) {
                     st.n_reads++;
@@ -1404,11 +1550,9 @@ struct server_cache_disk::state {
                     st.t_read_ms    += t_ms;
                     DSK_INF("read entry %s: %zu tokens, %.3f MiB in %.2f ms\n", hex64(id).c_str(), res->tokens.size(), n_bytes_entry / (1024.0 * 1024.0), t_ms);
 
-                    // the load is over: an entry superseded or removed meanwhile goes now
-                    remove = same && it->second.removing;
                     if (same && !remove) {
                         index_touch(id, time_now_ns());
-                        ops.push_back({ file_op::TOUCH, id });
+                        queue_touch_locked(id);
                     }
                 } else {
                     st.n_read_errors++;
@@ -1424,12 +1568,9 @@ struct server_cache_disk::state {
                         // so that later requests do not wait for it again
                         DSK_ERR("failed to read entry %s, dropping it from the index\n", hex64(id).c_str());
                         set_error_locked("cannot read entry " + hex64(id));
-                        if (same) {
-                            remove = it->second.removing;
-                            if (!remove) {
-                                index_erase(id);
-                                st.n_removed_missing++;
-                            }
+                        if (same && !remove) {
+                            index_erase(id);
+                            st.n_removed_missing++;
                         }
                     }
                     res = std::make_shared<loaded_entry>();
@@ -1438,7 +1579,7 @@ struct server_cache_disk::state {
                 if (remove) {
                     remove_locked(id, files);
                     if (!files.empty()) {
-                        ops.push_back({ file_op::REMOVE, id });
+                        ops.push_back({ file_op::REMOVE, id, gen });
                     }
                 }
 
@@ -1566,6 +1707,10 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
         s.test_write_errno = atoi(v);
         DSK_WRN("test: every write fails with errno %d\n", s.test_write_errno);
     }
+    if (getenv("LLAMA_SERVER_TEST_CACHE_DISK_READ_THROW")) {
+        s.test_read_throw = true;
+        DSK_WRN("%s", "test: every read fails with std::bad_alloc\n");
+    }
     if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS")) {
         s.t_test_write_delay_ms = atoll(v);
         DSK_WRN("test: the writer waits %" PRId64 " ms before each write\n", s.t_test_write_delay_ms);
@@ -1575,16 +1720,19 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     // index the entries: headers and tokens only
     const int64_t t_start = ggml_time_us();
 
+    // only the files named as this software names them are counted or removed, see is_entry_name() and parse_tmp_name();
+    // a symbolic link is never followed
     std::vector<std::string> files;
     for (const auto & de : fs::directory_iterator(dir, ec)) {
         const std::string name = de.path().filename().string();
 
-        if (is_tmp_name(name)) {
-            s.scan_tmp(de.path().string(), files);
+        if (long pid = 0; parse_tmp_name(name, pid)) {
+            s.scan_tmp(de.path().string(), pid, files);
             continue;
         }
 
-        if (name.size() != 16 + 4 || name.compare(16, 4, ".bin") != 0) {
+        struct stat sb;
+        if (!is_entry_name(name) || !lstat_regular(de.path().string(), sb)) {
             continue;
         }
 
@@ -1607,9 +1755,12 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     }
 
     // the entries of the other keys in the directory root count in the same bound
+    // a key directory is a real directory (not a symbolic link) whose IDENTITY starts with the format line, see
+    // is_key_dir(); in it, only the files named as this software names them are counted (and may be evicted)
     s.dir_root = dir_root;
     for (const auto & de : fs::directory_iterator(dir_root, ec)) {
-        if (!de.is_directory() || de.path().filename() == fs::path(dir).filename() || !fs::exists(de.path() / "IDENTITY")) {
+        const std::string path_key = de.path().string();
+        if (de.path().filename() == fs::path(dir).filename() || !is_key_dir(path_key)) {
             continue;
         }
 
@@ -1619,21 +1770,21 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
             if (name == "IDENTITY") {
                 continue;
             }
-            n_files++;
+            n_files++; // anything else keeps the directory
 
-            if (is_tmp_name(name)) {
-                s.scan_tmp(df.path().string(), files);
+            if (long pid = 0; parse_tmp_name(name, pid)) {
+                s.scan_tmp(df.path().string(), pid, files);
                 continue;
             }
 
             struct stat sb;
-            if (name.size() == 16 + 4 && name.compare(16, 4, ".bin") == 0 && stat(df.path().c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
-                s.other_put(df.path().string(), sb.st_size, (int64_t) sb.st_mtim.tv_sec*1000000000 + sb.st_mtim.tv_nsec);
+            if (is_entry_name(name) && lstat_regular(df.path().string(), sb)) {
+                s.other_put(df.path().string(), sb.st_size, clamp_now(mtime_ns_of(sb)));
             }
         }
 
         if (n_files == 0) {
-            state::remove_stale_key_dir(de.path().string());
+            state::remove_stale_key_dir(path_key);
         }
     }
 
@@ -1679,8 +1830,18 @@ void server_cache_disk::stage_locked(const server_prompt_cache_state & state, bo
         return;
     }
 
+    const int64_t t_now_ms = ggml_time_ms();
+    const int64_t t_progress_ms = state.prompt.t_unwritten_ms > 0 ? std::min(state.prompt.t_unwritten_ms, t_now_ms) : t_now_ms;
+
     if (auto it = st->staged.find(id); it != st->staged.end()) {
-        it->second.released = it->second.released || released;
+        auto & w = it->second;
+        w.released = w.released || released;
+        if (!released) {
+            // saved again: used now, and its progress is as old as the older of both saves
+            w.job.t_used    = time_now_ns();
+            w.t_progress_ms = std::min(w.t_progress_ms, t_progress_ms);
+            w.t_due_ms      = std::min(w.t_due_ms, w.t_progress_ms + st->t_delay_ms);
+        }
         return;
     }
 
@@ -1690,7 +1851,9 @@ void server_cache_disk::stage_locked(const server_prompt_cache_state & state, bo
     }
 
     if (st->index.count(id) && !st->is_removing_locked(id)) {
+        // the file's mtime keeps the order of use across a restart
         st->index_touch(id, time_now_ns());
+        st->queue_touch_locked(id);
         st->st.n_write_present++;
         return;
     }
@@ -1710,9 +1873,10 @@ void server_cache_disk::stage_locked(const server_prompt_cache_state & state, bo
     w.job.tokens  = std::move(tokens);
     w.job.t_used  = time_now_ns();
 
-    w.t_staged_ms = ggml_time_ms();
-    w.t_due_ms    = released ? w.t_staged_ms : w.t_staged_ms + st->t_delay_ms;
-    w.released    = released;
+    w.t_staged_ms   = t_now_ms;
+    w.t_progress_ms = t_progress_ms;
+    w.t_due_ms      = released ? t_now_ms : t_progress_ms + st->t_delay_ms;
+    w.released      = released;
 
     st->staged_bytes += w.job.n_bytes;
     st->staged.emplace(id, std::move(w));
@@ -1726,15 +1890,18 @@ void server_cache_disk::stage(const server_prompt_cache_state & state) {
     st->cv_jobs.notify_all();
 }
 
-void server_cache_disk::drop(uint64_t id) {
+int64_t server_cache_disk::drop(uint64_t id) {
     std::unique_lock<std::mutex> lock(st->mtx);
 
     auto it = st->staged.find(id);
     if (it == st->staged.end() || it->second.released) {
-        return;
+        return 0;
     }
 
-    DSK_DBG("entry %s left the RAM cache before it was written, not writing it\n", hex64(id).c_str());
+    const int64_t t_progress_ms = it->second.t_progress_ms;
+
+    DSK_DBG("entry %s left the RAM cache before it was written, not writing it (its progress is %.1f s old)\n",
+            hex64(id).c_str(), (ggml_time_ms() - t_progress_ms) / 1000.0);
 
     st->st.n_write_skipped++;
     st->st.n_bytes_skipped += it->second.job.n_bytes;
@@ -1743,6 +1910,30 @@ void server_cache_disk::drop(uint64_t id) {
 
     lock.unlock();
     st->cv_done.notify_all();
+
+    return t_progress_ms;
+}
+
+void server_cache_disk::write_ahead(const std::vector<uint64_t> & ids) {
+    bool any = false;
+    {
+        std::unique_lock<std::mutex> lock(st->mtx);
+        for (const uint64_t id : ids) {
+            if (auto it = st->staged.find(id); it != st->staged.end() && !it->second.ahead && !it->second.released) {
+                DSK_DBG("entry %s is among the next ones the RAM cache drops, writing it ahead\n", hex64(id).c_str());
+                it->second.ahead = true;
+                any = true;
+            }
+        }
+    }
+    if (any) {
+        st->cv_jobs.notify_all();
+    }
+}
+
+void server_cache_disk::set_wait_allowed(bool allowed) {
+    std::unique_lock<std::mutex> lock(st->mtx);
+    st->wait_allowed = allowed;
 }
 
 void server_cache_disk::release(const server_prompt_cache_state & state) {
@@ -1772,7 +1963,34 @@ void server_cache_disk::release(const server_prompt_cache_state & state) {
         return n;
     };
 
+    // drop the entry instead of holding its memory: it is lost unless it is on disk already (then needed is false)
+    const auto drop_entry = [&]() {
+        if (auto it = st->staged.find(id); it != st->staged.end()) {
+            st->staged_bytes -= it->second.job.n_bytes;
+            st->staged.erase(it);
+        }
+        st->st.n_write_dropped++;
+    };
+
     if (needed && n_released() > 0 && !st->stopping) {
+        // the server loop must not wait (going to sleep, the task queue is locked)
+        if (!st->wait_allowed) {
+            DSK_WRN("the disk writer is busy and the server may not wait, dropping entry %s instead of holding its memory\n", hex64(id).c_str());
+            drop_entry();
+            st->st.n_write_dropped_nowait++;
+            return;
+        }
+
+        // a wait timed out and the writer has not finished a write since: it is stuck (a hung disk), waiting again
+        // would only freeze the server loop once more
+        if (st->stalled && st->n_progress == st->stalled_at) {
+            DSK_WRN("the disk writer is stalled, dropping entry %s without waiting\n", hex64(id).c_str());
+            drop_entry();
+            st->st.n_write_dropped_stalled++;
+            return;
+        }
+        st->stalled = false;
+
         const int64_t t_start = ggml_time_ms();
 
         st->st.n_backlog_waits++;
@@ -1785,13 +2003,13 @@ void server_cache_disk::release(const server_prompt_cache_state & state) {
         st->st.t_backlog_wait_ms += ggml_time_ms() - t_start;
 
         if (!ok) {
-            DSK_ERR("the disk writer did not keep up for %.1f s, dropping entry %s instead of holding its memory\n",
+            DSK_ERR("the disk writer did not keep up for %.1f s, dropping entry %s instead of holding its memory; "
+                    "the next entries are dropped without waiting until it finishes a write\n",
                     st->t_wait_max_ms / 1000.0, hex64(id).c_str());
-            if (auto it = st->staged.find(id); it != st->staged.end()) {
-                st->staged_bytes -= it->second.job.n_bytes;
-                st->staged.erase(it);
-            }
-            st->st.n_write_dropped++;
+            st->stalled    = true;
+            st->stalled_at = st->n_progress;
+            st->st.n_backlog_timeouts++;
+            drop_entry();
             return;
         }
     }
@@ -1898,12 +2116,21 @@ server_cache_disk::load_result server_cache_disk::take_loaded(uint64_t id, serve
 void server_cache_disk::touch(uint64_t id) {
     std::unique_lock<std::mutex> lock(st->mtx);
 
-    if (st->stopping || !st->index.count(id)) {
+    if (st->stopping) {
+        return;
+    }
+
+    // not written yet: it is written with this last use as its mtime
+    if (auto it = st->staged.find(id); it != st->staged.end()) {
+        it->second.job.t_used = time_now_ns();
+    }
+
+    if (!st->index.count(id) || st->is_removing_locked(id)) {
         return;
     }
 
     st->index_touch(id, time_now_ns());
-    st->ops.push_back({ file_op::TOUCH, id });
+    st->queue_touch_locked(id);
 
     lock.unlock();
     st->cv_jobs.notify_all();

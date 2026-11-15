@@ -20,10 +20,12 @@
 // start-up are indexed (tokens, checkpoint positions and sizes, not the states), so that a conversation survives a
 // restart and conversations beyond --cache-ram stay resumable
 //
-// write-behind: an entry saved to the RAM cache is written once it has stayed there unwritten for --cache-dir-delay
-// seconds, when the RAM cache drops it to stay within its limits (the writer then holds its memory until it is
-// written), or when a flush asks for everything (persist, shutdown, sleep); an entry that leaves the RAM cache before
-// its delay because a slot continues it is not written (a later save of the slot supersedes it)
+// write-behind: --cache-dir-delay is the maximum age of a conversation's unwritten progress: an entry saved to the RAM
+// cache is written once its oldest progress not on disk is --cache-dir-delay seconds old, when the RAM cache drops it
+// to stay within its limits (the writer then holds its memory until it is written), when it is one of the next
+// entries the RAM cache will drop (write-ahead, see write_ahead()), or when a flush asks for everything (persist,
+// shutdown, sleep); an entry that leaves the RAM cache before then because a slot continues it is not written, the
+// slot inherits the age of its progress (see drop()) and its next save supersedes it
 //
 // - <key> names everything that shapes a saved state (model and draft files, context and KV settings), so a state is
 //   never loaded into an engine that would not have computed it, see server_context_impl::cache_disk_identity()
@@ -68,6 +70,7 @@ struct server_cache_disk_stats {
     size_t n_released_bytes = 0;
     uint64_t n_backlog_waits   = 0; // times the server loop waited for the writer, see release()
     int64_t  t_backlog_wait_ms = 0;
+    uint64_t n_backlog_timeouts = 0; // waits that ended after t_wait_max_ms: the writer is considered stalled
 
     int64_t t_delay_ms = 0;
 
@@ -76,7 +79,11 @@ struct server_cache_disk_stats {
     uint64_t n_write_present = 0; // already on disk
     uint64_t n_write_no_room = 0; // larger than the bound
     uint64_t n_write_errors  = 0;
-    uint64_t n_write_dropped = 0; // dropped by the RAM cache while the writer did not keep up
+    uint64_t n_write_dropped = 0; // dropped by the RAM cache while the writer did not keep up (all causes)
+    uint64_t n_write_dropped_stalled = 0; // of which without waiting: the writer made no progress since a timeout
+    uint64_t n_write_dropped_nowait  = 0; // of which without waiting: the server loop may not wait (going to sleep)
+    uint64_t n_write_ahead   = 0; // writes started before the delay because the RAM cache was about to drop the entry
+    uint64_t n_touches       = 0; // file mtime updates (LRU order across restarts), coalesced per entry
     uint64_t n_reads         = 0;
     uint64_t n_read_errors   = 0;
     uint64_t n_removed_corrupt    = 0;
@@ -128,15 +135,28 @@ struct server_cache_disk {
 
     const std::string & dir() const { return path_dir; }
 
-    // an entry was saved to the RAM cache: write it after the delay, unless it is already on disk
+    // an entry was saved to the RAM cache: write it once its oldest unwritten progress is t_delay_ms old
+    // (state.prompt.t_unwritten_ms, now if 0), unless it is already on disk (then its file is touched)
     void stage(const server_prompt_cache_state & state);
 
     // the entry left the RAM cache because a slot continues it (or a newer entry contains it): do not write it
-    void drop(uint64_t id);
+    // returns the time of its oldest unwritten progress (ggml_time_ms()), for the continuation to inherit, 0 if the
+    // entry is not waiting to be written
+    int64_t drop(uint64_t id);
+
+    // the RAM cache is about to drop these entries (its least recently used ones, above its high-water mark): write
+    // them now, regardless of their delay, so that release() finds them on disk
+    void write_ahead(const std::vector<uint64_t> & ids);
+
+    // false: release() never waits for the writer, it drops the entry instead (the server loop holds a lock that
+    // must not wait for the disk, e.g. going to sleep)
+    void set_wait_allowed(bool allowed);
 
     // the RAM cache drops the entry to stay within its limits: write it now, unless it is already on disk
     // the writer then holds its memory: if it holds another such entry already, this waits until that one is written
-    // (at most t_wait_max_ms, then the entry is dropped), so that the memory beyond --cache-ram stays within one entry
+    // (at most t_wait_max_ms, then the entry is dropped), so that the memory beyond --cache-ram stays within one entry;
+    // after such a timeout, entries are dropped without waiting until the writer finishes a write (a hung disk freezes
+    // the server loop once), and never waits while set_wait_allowed(false)
     void release(const server_prompt_cache_state & state);
 
     // write every entry not written yet, the most recently saved first; returns the ticket for wait()
@@ -155,7 +175,7 @@ struct server_cache_disk {
     // take the state read by load_async(); LOAD_FAILED if the read failed (a corrupt file is removed)
     load_result take_loaded(uint64_t id, server_prompt_cache_state & out, bool has_mtmd);
 
-    // mark an entry as used now (LRU)
+    // mark an entry as used now (LRU): its file's mtime, or the mtime it will be written with
     void touch(uint64_t id);
 
     // a restore of the entry failed: it is not offered again by this server, its file is kept

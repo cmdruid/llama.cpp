@@ -1720,8 +1720,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_DIR_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-dir-delay"}, "N",
-        string_format("seconds a prompt cache entry stays in RAM unwritten before it is written to --cache-dir; an entry that a request\n"
-                      "continues before then is not written, one that the RAM cache drops is written first (default: %d, 0 = at once)", params.cache_dir_delay),
+        string_format("maximum age in seconds of a conversation's progress not yet written to --cache-dir: a prompt cache entry is\n"
+                      "written once its oldest unwritten progress is this old, an idle slot is saved and written then too; an entry\n"
+                      "that a request continues before then is not written, one that the RAM cache drops is written first (default: %d, 0 = at once)", params.cache_dir_delay),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("cache-dir-delay must be non-negative");

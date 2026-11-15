@@ -726,10 +726,16 @@ struct server_prompt {
     // see server_task::n_tokens_protected()
     int32_t n_protected = 0;
 
+    // the time (ggml_time_ms()) of the oldest progress of this conversation that is not on disk, 0 = none or unknown
+    // set when a slot starts a task, inherited from the cache entries it continues, see server_cache_disk::drop();
+    // the disk tier writes an entry once this is --cache-dir-delay old
+    int64_t t_unwritten_ms = 0;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
         n_protected = 0;
+        // t_unwritten_ms is kept: a slot that clears its prompt to process a task keeps the age of its progress
     }
 
     int n_tokens() const {
@@ -747,10 +753,12 @@ struct server_prompt {
     }
 
     server_prompt clone() const {
+        // a copy is a branch: its progress starts when it is used
         return server_prompt {
             tokens.clone(),
             checkpoints,
             n_protected,
+            0,
         };
     }
 };
@@ -859,6 +867,14 @@ struct server_prompt_cache {
 
     // drop the oldest entry to stay within the limits, the disk tier writes it first
     void evict_oldest();
+
+    // above this share of limit_size, the least recently used entries are written to disk ahead of their delay, so
+    // that an eviction finds them there instead of waiting for the writer, see write_ahead()
+    static constexpr double WRITE_AHEAD_MARK = 0.8;
+
+    // above the mark: ask the disk tier to write the next eviction victims now (the two least recently used entries,
+    // and more if evicting them would not bring the cache back to the mark)
+    void write_ahead() const;
 
     // the disk entry the request reuses most, if it reuses more than n_floor tokens and is not in RAM already
     std::shared_ptr<const server_cache_disk_entry> find_disk(const server_tokens & tokens_new, int32_t n_floor) const;
