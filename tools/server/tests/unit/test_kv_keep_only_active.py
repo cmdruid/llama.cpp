@@ -113,3 +113,40 @@ def test_disabled_with_flag():
     })
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+
+# a request pinned to a slot that was cleared must still restore its prompt from cache-ram
+@pytest.mark.parametrize("slot_prompt_similarity", [None, 0.0])
+def test_pinned_empty_slot_restores_from_cache(slot_prompt_similarity):
+    global server
+    server.slot_prompt_similarity = slot_prompt_similarity
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    original_prompt_n = res.body["timings"]["prompt_n"]
+
+    # launching slot 1 saves idle slot 0 to the cache and clears it
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
+
+    # the same prompt pinned to the now empty slot 0 is restored from the cache
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in log.drain()
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["timings"]["prompt_n"] < original_prompt_n

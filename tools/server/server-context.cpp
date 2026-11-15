@@ -1815,11 +1815,18 @@ private:
                 }
 
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+
+                // the similarity search below skips an empty slot and is off with --slot-prompt-similarity 0,
+                // so decide here: consult the prompt cache unless the slot keeps most of its context
+                const size_t n_slot = ret->prompt.tokens.size();
+                const size_t n_lcp  = ret->prompt.tokens.get_common_prefix(task.tokens);
+
+                update_cache = n_slot == 0 || float(n_lcp) / n_slot < 0.5f;
             }
         }
 
         // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
