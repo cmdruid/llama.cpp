@@ -221,8 +221,13 @@ def test_chat_reply_rendered_differently_continues():
     log = LogReader(server.log_path)
 
     chat(CHAT_HEAD)
-    slot = server.make_request("GET", "/cache").body["slots"][0]
-    assert 0 < slot["n_protected"] < slot["n_tokens"]
+    # the slots' status is in the detailed status of a test build (-DLLAMA_SERVER_TEST_HOOKS=ON)
+    status = server.make_request("GET", "/cache").body
+    n_protected = 0
+    if "test" in status:
+        slot = status["test"]["slots"][0]
+        assert 0 < slot["n_protected"] < slot["n_tokens"]
+        n_protected = slot["n_protected"]
 
     chat(CHAT_OTHER)
     log.drain()
@@ -235,10 +240,10 @@ def test_chat_reply_rendered_differently_continues():
     out = log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
     assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in out
     assert "__TEST_TAG_PROMPT_CACHE_KEEP__" not in out
-    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] >= slot["n_protected"] - 1
+    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] >= max(n_protected - 1, 1)
 
     # the entry moved into the slot: the cache holds only the other conversation
-    assert server.make_request("GET", "/cache").body["ram"]["entries"] == 1
+    assert server.make_request("GET", "/cache").body["memory"]["entries"] == 1
 
 
 # chat: a request that edits the last user message does not continue the conversation: it branches off it, and the

@@ -1310,21 +1310,44 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 ### GET `/cache`: Prompt cache status
 
-Entries and bytes of the RAM tier (`--cache-ram`) and of the disk tier (`--cache-dir`), the disk writer's backlog,
-counters (`saves`, `hits_ram`, `hits_disk`, `misses`, `evictions_ram`, `failed_restores`, `persists`) with the
-cumulated save and load times, and the length of each slot's conversation. While the server sleeps, only `disk` is
-reported (`"sleeping": true`). Contains no prompt content.
+What the prompt cache holds, in three tiers, and how the disk tier is doing. Requires the API key like the other
+routes. Contains no prompt content.
 
-The disk writer's counters show the write-behind at work: `backlog_entries`/`backlog_bytes` are the entries not
-written yet (waiting for their `delay_s`, queued or in progress), `writes`/`bytes_written` the entries written,
-`writes_skipped`/`bytes_skipped` the entries a request continued before their delay expired (never written),
-`writes_present` the entries that were already on disk (their file is touched instead, `touches` counts the mtime
-updates), `writes_no_room` the entries for which the bound left no room and `writes_ahead` the entries written before
-their delay because the RAM cache was about to drop them. `backlog_waits`/`backlog_wait_ms` count the times the server
-loop waited for the writer, `backlog_timeouts` the waits that ran out (the writer is then taken as stalled),
-`writes_dropped` the entries dropped instead of written, of which `writes_dropped_stalled` without waiting for a stalled
-writer. `bytes` counts every file under `DIR`,
-`other_entries`/`other_bytes` the part of it that belongs to other keys.
+**Response format**
+
+```json
+{
+    "live":   { "entries": 1 },
+    "memory": { "entries": 3 },
+    "disk": {
+        "entries":      12,
+        "bytes":        9663676416,
+        "limit_bytes":  34359738368,
+        "persists":     57,
+        "failures":     0,
+        "last_persist": 1763208000
+    }
+}
+```
+
+| Member | Meaning |
+| --- | --- |
+| `live.entries` | slots that hold a conversation (its state is in the KV cache) |
+| `memory` | `null` without a RAM tier (`--cache-ram 0`) |
+| `memory.entries` | conversations parked in the RAM tier (`--cache-ram`) |
+| `disk` | `null` without a disk tier (no `--cache-dir`, or `--cache-dir` without `--cache-ram`, or the directory cannot be used) |
+| `disk.entries` | entries on disk that this server can load (its key; entries of other keys are not counted here) |
+| `disk.bytes` | bytes of every file the disk tier counts under `--cache-dir`, all keys and writes in progress included: the figure `--cache-dir-max` bounds |
+| `disk.limit_bytes` | `--cache-dir-max` in bytes |
+| `disk.persists` | entries written to disk since the server started, the shutdown persist included |
+| `disk.failures` | entries due to be written that were not, since the server started: the write failed, the bound left no room for the entry, or the RAM cache dropped it while the writer did not keep up. Each is lost once it leaves RAM |
+| `disk.last_persist` | time of the last entry written, Unix seconds; `null` until the first write of this server process |
+
+The counts are integers. While the server sleeps (`--sleep-idle-seconds`), the slots and the RAM tier are released:
+`live.entries` and `memory.entries` are 0 and `disk` is reported as usual.
+
+A server built with `-DLLAMA_SERVER_TEST_HOOKS=ON` (for `tools/server/tests`) adds a `test` member with the internal
+counters of both tiers; it is not part of the API and never present in a production build.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
@@ -2663,8 +2686,8 @@ file larger than the bound is never read.
 An entry whose file is gone (removed by hand, or with the directory) is dropped from the index when it is next read or
 touched, and the request waiting for it proceeds without it; a removed directory is created again by the next write.
 A state that fails to restore (for instance it does not fit beside the other slots) is not proof that the entry is bad:
-the request proceeds without it, the file is kept for a later run and this server does not offer it again
-(`quarantined` in `GET /cache`); only a checksum or format error removes a file.
+the request proceeds without it, the file is kept for a later run and this server does not offer it again;
+only a checksum or format error removes a file.
 At start-up only the headers and tokens are read. A request that a disk entry serves better than RAM waits while the
 entry is read in the background (other requests are not blocked), then it is restored as from RAM; the disk copy is
 kept. An entry superseded by a newer one while it is being read is removed when the read ends; the waiting request
@@ -2678,7 +2701,7 @@ a rewrite when an entry on disk is saved again), not the time of its write, and 
 less recently than itself, so the order in which the writer works does not change which entries stay. A last use is
 never later than the present: an mtime in the future (the clock was stepped back, files were restored) counts as now,
 so such entries are evicted like the others instead of filling the bound. When a conversation grows, the entry it replaces makes room first. The entries of live conversations and those being read are
-not evicted; if they leave no room for a new entry, its write is skipped (`writes_no_room`) and it stays in RAM, where
+not evicted; if they leave no room for a new entry, its write is skipped (a `failure` in `GET /cache`) and it stays in RAM, where
 it is lost once the RAM cache drops it (it is not written again). During
 a write, the entries it supersedes stay on disk until it completes. Prompts with media are not written to disk. `GET /cache` shows what the tiers hold.
 
@@ -2686,7 +2709,7 @@ a write, the entries it supersedes stay on disk until it completes. Prompts with
 not written when it is saved to RAM, but when one of these happens first:
 - its oldest unwritten progress is `--cache-dir-delay` seconds old (default 60; 0 writes it at once). That age starts
   when a slot starts a task on its conversation after the conversation was last saved; an entry that a request continues before it is written
-  leaves RAM for the slot and is not written (`writes_skipped`), but the slot keeps the age of its progress, and so
+  leaves RAM for the slot and is not written, but the slot keeps the age of its progress, and so
   does the entry its next save creates. A conversation in constant use is therefore written at most
   `--cache-dir-delay` seconds after its first unwritten turn, then the age starts again with its next turn;
 - a conversation that stays in its slot has no entry: an idle slot whose progress is `--cache-dir-delay` seconds old is
@@ -2695,13 +2718,12 @@ not written when it is saved to RAM, but when one of these happens first:
   never done while a slot is processing, and a request that arrives meanwhile waits for it. With
   `--cache-dir-delay 0` a live slot is written only when it is saved for another reason;
 - the RAM cache holds more than 80 % of `--cache-ram`: its two least recently used entries (more if dropping those
-  would not bring it back to 80 %) are written ahead of their delay (`writes_ahead`), so that the entry the RAM cache
+  would not bring it back to 80 %) are written ahead of their delay, so that the entry the RAM cache
   drops next is usually on disk already;
 - the RAM cache drops it to stay within `--cache-ram`: the writer keeps its memory until it is written. To bound that
-  memory to one entry beyond `--cache-ram`, the server waits for the writer before it hands it another such entry
-  (`backlog_waits`, `backlog_wait_ms`, `released_entries`/`released_bytes` in `GET /cache`); if the writer does not
-  keep up within `--cache-persist-timeout`, the entry is dropped instead (`writes_dropped`, `backlog_timeouts`), and
-  until the writer finishes a write the next such entries are dropped without waiting (`writes_dropped_stalled`), so a
+  memory to one entry beyond `--cache-ram`, the server waits for the writer before it hands it another such entry;
+  if the writer does not keep up within `--cache-persist-timeout`, the entry is dropped instead (a `failure` in
+  `GET /cache`), and until the writer finishes a write the next such entries are dropped without waiting, so a
   hung disk stops the server loop once, not at every eviction. With write-ahead these waits and drops are rare: they need entries dropped from RAM
   faster than the writer writes them;
 - a graceful shutdown (SIGTERM): the slots are saved and everything not written yet is written, the most recently
@@ -2721,12 +2743,11 @@ supersedes it. A crash (SIGKILL, power loss) loses exactly what is not on disk: 
 since its last written copy (it resumes from that copy, or cold). That progress is at most `--cache-dir-delay` seconds
 old plus the time the writer needs for the writes queued before it, except for the progress of a slot whose
 conversation stays in it while some slot is processing without a pause (it is saved only when no slot is processing or
-when it leaves the slot), and for entries that are not written at all: those for which the bound left no room
-(`writes_no_room`), whose write failed (`write_errors`), that were dropped (`writes_dropped`), prompts with media and
+when it leaves the slot), and for entries that are not written at all: those for which the bound left no room,
+whose write failed, that were dropped (these three are the `failures` of `GET /cache`), prompts with media and
 states larger than `--cache-ram`; with `--cache-dir-delay 0`, also the progress of a live slot since it was last saved.
 A graceful stop loses nothing that fits in `--cache-persist-timeout`. A request that is cancelled while it waits for a
-disk read releases the read: its state is not kept (`waiting` in `GET /cache` counts the requests waiting for a read,
-`disk.loaded` the reads not taken yet).
+disk read releases the read: its state is not kept.
 
 ## Sleeping on Idle
 

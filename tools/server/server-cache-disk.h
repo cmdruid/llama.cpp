@@ -75,6 +75,7 @@ struct server_cache_disk_stats {
     int64_t t_delay_ms = 0;
 
     uint64_t n_writes        = 0;
+    int64_t  t_last_write    = 0; // Unix time (seconds) of the last entry written, 0 = none since the start
     uint64_t n_write_skipped = 0; // left the RAM cache (a slot continued them) before they were written
     uint64_t n_write_present = 0; // already on disk
     uint64_t n_write_no_room = 0; // larger than the bound

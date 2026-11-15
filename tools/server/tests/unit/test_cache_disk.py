@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import pytest
+import requests
 from utils import *
 
 # disk tier of the prompt cache (--cache-dir): entries are written to disk, survive a restart, are bounded by
@@ -176,7 +177,7 @@ def test_bound_evicts_oldest_keeps_live(monkeypatch, write_delay):
     # less recently than itself, so a lagging writer skips the older ones instead of evicting the newer ones
     t0 = time.time()
     while True:
-        st = cache_status()["disk"]
+        st = disk_detail()
         if st["backlog_entries"] == 0 and st["writes"] + st["writes_no_room"] >= 5:
             break
         assert time.time() - t0 < 20, st
@@ -297,6 +298,58 @@ def kill():
     os.replace(server.log_path, server.log_path + ".prev")
 
 
+# GET /cache: what the cache holds (the live slots, the RAM cache, the disk tier with its bytes and bound), the entries
+# written to disk, those that could not be, and the time of the last write
+def test_cache_status():
+    global server
+    server.cache_dir_max = 1 # MiB, about two of the conversations below
+    server.start()
+
+    st = cache_status()
+    assert st["live"] == {"entries": 0}
+    assert st["memory"] == {"entries": 0}
+    assert st["disk"] == {
+        "entries": 0, "bytes": 0, "limit_bytes": 1024*1024, "persists": 0, "failures": 0, "last_persist": None,
+    }
+    assert ("test" in st) == TEST_HOOKS
+
+    complete(LONG_PROMPT)
+    st = cache_status()
+    assert st["live"]["entries"] == 1
+    assert st["memory"]["entries"] == 0
+    assert st["disk"]["persists"] == 0
+
+    t0 = int(time.time())
+    complete(OTHER_PROMPT) # LONG goes to the RAM cache and is written (delay 0)
+    st = wait_disk("persists", 1)
+    assert t0 <= st["last_persist"] <= int(time.time())
+    assert st["entries"] == 1
+    assert st["bytes"] == sum(os.path.getsize(p) for p in entry_files())
+    assert st["failures"] == 0
+    st = cache_status()
+    assert st["live"]["entries"] == 1
+    assert st["memory"]["entries"] == 1
+
+    # an entry larger than the bound cannot be written: a failure
+    complete(conversation(0, 10))
+    complete(OTHER_PROMPT + " Again.")
+    st = wait_disk("failures", 1)
+    assert st["persists"] == 2 # OTHER
+    assert st["entries"] == 2
+
+
+# GET /cache needs the API key like the other routes
+def test_cache_status_needs_key():
+    global server
+    server.api_key = "cache-key"
+    server.start()
+    res = requests.get(f"http://{server.server_host}:{server.server_port}/cache")
+    assert res.status_code == 401
+    res = server.make_request("GET", "/cache", headers={"Authorization": "Bearer cache-key"})
+    assert res.status_code == 200
+    assert res.body["live"] == {"entries": 0}
+
+
 # a graceful shutdown (SIGTERM) persists the live slots
 def test_sigterm_persists_live_slot():
     global server
@@ -327,13 +380,14 @@ def test_sleep_keeps_disk_tier():
     n_long = n_tokens(LONG_PROMPT)
     complete(LONG_PROMPT)
     complete(OTHER_PROMPT) # LONG is written (delay 0)
-    wait_disk("writes", 1)
+    wait_disk("persists", 1)
 
     assert "server is entering sleeping state" in log.wait_for("server is entering sleeping state", timeout=10)
-    res = server.make_request("GET", "/cache")
-    assert res.status_code == 200
-    assert res.body["sleeping"] is True
-    assert res.body["disk"]["entries"] == 1
+    st = cache_status()
+    assert st["live"]["entries"] == 0
+    assert st["memory"]["entries"] == 0
+    assert st["disk"]["entries"] == 1
+    assert st["disk"]["persists"] == 1
 
     body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
@@ -361,6 +415,23 @@ def cache_status():
     res = server.make_request("GET", "/cache")
     assert res.status_code == 200
     return res.body
+
+
+# the disk tier in GET /cache
+def disk():
+    return cache_status()["disk"]
+
+
+# the detailed status of a test build (-DLLAMA_SERVER_TEST_HOOKS=ON): every counter of the disk tier ("disk"), the RAM
+# cache ("ram", "counters"), the slots and the requests waiting for a disk read
+def detail():
+    if not TEST_HOOKS:
+        pytest.skip("the detailed cache status needs llama-server built with -DLLAMA_SERVER_TEST_HOOKS=ON (and LLAMA_SERVER_TEST_HOOKS=1)")
+    return cache_status()["test"]
+
+
+def disk_detail():
+    return detail()["disk"]
 
 
 class Background:
@@ -412,18 +483,18 @@ def test_superseded_while_loading(monkeypatch):
     # B takes the slot meanwhile and is written once its progress is a second old (the idle slot save): its entry
     # supersedes the one being read
     complete(LONG_PROMPT + " B", cache_prompt=False)
-    wait_disk("writes", 1)
+    wait_disk("persists", 1)
 
     # removing the entry waits for the end of the load
     assert path_long in entry_files()
-    assert cache_status()["disk"]["loading"] == 1
+    assert disk_detail()["loading"] == 1
 
     body = a.join()
     assert body["timings"]["cache_n"] >= n_long
     assert path_long not in entry_files()
 
     # the superseded entry is gone from the index and from the directory
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["removed_superseded"] == 1
     assert st["entries"] == len(entry_files())
 
@@ -441,20 +512,21 @@ def test_superseded_while_loading(monkeypatch):
 def wait_idle_writer(timeout=10.0):
     t0 = time.time()
     while True:
-        st = cache_status()["disk"]
+        st = disk_detail()
         if st["backlog_entries"] == 0 and st["entries"] == len(entry_files()):
             time.sleep(1.5) # an idle slot is saved at most a second after its delay
-            st = cache_status()["disk"]
+            st = disk_detail()
             if st["backlog_entries"] == 0:
                 return st
         assert time.time() - t0 < timeout, st
         time.sleep(0.05)
 
 
+# GET /cache figures of the disk tier: persists, failures, entries, bytes; any other key is read from the detailed status
 def wait_disk(key, value, timeout=10.0):
     t0 = time.time()
     while True:
-        st = cache_status()["disk"]
+        st = disk() if key in ("persists", "failures", "entries", "bytes") else disk_detail()
         if st[key] >= value:
             return st
         assert time.time() - t0 < timeout, f"expected disk {key} >= {value}, got {st}"
@@ -472,7 +544,7 @@ def test_resumed_before_delay_is_not_written():
     body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
     assert body["timings"]["cache_n"] >= n_tokens(LONG_PROMPT)
 
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["writes"] == 0
     assert st["writes_skipped"] == 1
     assert st["bytes_skipped"] > 0
@@ -490,14 +562,14 @@ def test_written_after_delay():
     complete(LONG_PROMPT)
     complete(OTHER_PROMPT)
     t0 = time.time()
-    assert cache_status()["disk"]["backlog_entries"] == 1
+    assert disk_detail()["backlog_entries"] == 1
     assert entry_files() == []
 
-    wait_disk("writes", 1)
+    wait_disk("persists", 1)
     assert time.time() - t0 > 1.5
-    wait_disk("writes", 2)
+    wait_disk("persists", 2)
     assert len(entry_files()) == 2
-    assert cache_status()["disk"]["backlog_entries"] == 0
+    assert disk_detail()["backlog_entries"] == 0
 
 
 # write-behind: an entry that the RAM cache drops to stay within its limit is written at once
@@ -513,11 +585,12 @@ def test_ram_eviction_writes():
 
     # the two oldest left RAM and are written; the two oldest of those in RAM are written ahead of their delay (the RAM
     # cache is above its high-water mark), the newest one waits for its delay
-    st = wait_disk("writes", 4)
+    wait_disk("persists", 4)
+    st = disk_detail()
     assert st["writes"] == 4
     assert st["writes_ahead"] == 4
     assert st["backlog_entries"] == 0
-    assert cache_status()["counters"]["evictions_ram"] == 2
+    assert detail()["counters"]["evictions_ram"] == 2
 
     # they are read back from disk
     log = LogReader(server.log_path)
@@ -537,7 +610,7 @@ def test_shutdown_writes_everything():
         complete(conversation(i, 1))
     slot = conversation(9, 2)
     complete(slot)
-    assert cache_status()["disk"]["backlog_entries"] == 3
+    assert disk_detail()["backlog_entries"] == 3
     n_slot = n_tokens(slot)
 
     restart() # SIGTERM
@@ -559,11 +632,11 @@ def test_delay_zero_is_write_through():
 
     complete(LONG_PROMPT)
     complete(OTHER_PROMPT)
-    wait_disk("writes", 1)
+    wait_disk("persists", 1)
     path = entry_files()[0]
 
     complete(LONG_PROMPT + " The knight finally reached the castle gates.")
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["writes_skipped"] == 0
     assert path in entry_files()
 
@@ -612,19 +685,20 @@ def test_bound_counts_other_keys():
     server.cache_dir_max = 2
     server.start()
 
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["entries"] == 0
     assert st["other_entries"] == 2
     assert st["bytes"] == sum(os.path.getsize(p) for p in entry_files())
 
     complete(conversation(2, 4))
     complete(conversation(3, 4)) # 2 is written
-    wait_disk("writes", 1)
-    assert cache_status()["disk"]["other_entries"] == 2
+    wait_disk("persists", 1)
+    assert disk_detail()["other_entries"] == 2
 
     # no room for a second entry of this key without the entries of the other key
     complete(OTHER_PROMPT) # 3 is written
-    st = wait_disk("writes", 2)
+    wait_disk("persists", 2)
+    st = disk_detail()
     assert st["other_entries"] == 0
     assert st["entries"] == 2
     assert st["removed_evicted"] == 2
@@ -672,7 +746,7 @@ def test_superseded_entry_makes_room():
     assert len([l for l in out.splitlines() if "superseded by" in l]) == 1
     assert "evicting entry" not in out
     assert path_unrelated in entry_files()
-    st = cache_status()["disk"]
+    st = disk()
     assert st["bytes"] <= st["limit_bytes"]
 
 
@@ -725,7 +799,7 @@ def test_missing_file_is_dropped():
     assert "reading disk cache entry" in out
     assert "failed to read entry" in out
     assert body["timings"]["cache_n"] == 0
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["entries"] == 0
     assert st["removed_missing"] == 1
 
@@ -742,13 +816,14 @@ def test_removed_directory_is_recreated():
     server.start()
     complete(LONG_PROMPT)
     complete(OTHER_PROMPT)
-    wait_disk("writes", 1)
+    wait_disk("persists", 1)
     [key_dir] = key_dirs()
 
     shutil.rmtree(server.cache_dir)
 
     complete(conversation(1)) # OTHER is written
-    st = wait_disk("writes", 2)
+    wait_disk("persists", 2)
+    st = disk_detail()
     assert st["write_errors"] == 0
     assert st["entries"] == 1
     assert st["removed_missing"] == 1
@@ -787,7 +862,7 @@ def test_corrupt_entry_rewritten():
 
     restart() # SIGTERM writes the slot again
     assert entry_files() == [path]
-    assert cache_status()["disk"]["entries"] == 1
+    assert disk()["entries"] == 1
     log = LogReader(server.log_path)
     complete(LONG_PROMPT)
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
@@ -825,7 +900,7 @@ def test_restore_failure_keeps_disk_entry(monkeypatch):
     assert "failed to restore" in log.wait_for("failed to restore")
     assert body["timings"]["cache_n"] == 0
     assert path in entry_files()
-    st = cache_status()
+    st = detail()
     assert st["disk"]["quarantined"] == 1
     assert st["counters"]["failed_restores"] == 1
 
@@ -867,7 +942,7 @@ def test_stale_temporary_files():
     assert not os.path.exists(gone)
     assert not os.path.exists(old)
     assert os.path.exists(live)
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["bytes"] == 1000
     assert st["other_entries"] == 1
 
@@ -889,7 +964,7 @@ def test_backlog_bounded_beyond_ram(monkeypatch):
     stop = threading.Event()
     def watch():
         while not stop.is_set():
-            seen.append(cache_status()["disk"]["released_entries"])
+            seen.append(disk_detail()["released_entries"])
             time.sleep(0.05)
     watcher = threading.Thread(target=watch)
     watcher.start()
@@ -901,7 +976,8 @@ def test_backlog_bounded_beyond_ram(monkeypatch):
         stop.set()
         watcher.join()
 
-    st = wait_disk("writes", 2)
+    wait_disk("persists", 2)
+    st = disk_detail()
     assert st["backlog_waits"] >= 1
     assert st["backlog_wait_ms"] > 500
     assert st["writes_dropped"] == 0
@@ -934,7 +1010,7 @@ def test_cancelled_waiting_task_releases_read(monkeypatch):
 
     t0 = time.time()
     while True:
-        st = cache_status()
+        st = detail()
         if st["disk"]["loading"] == 0 and st["waiting"] == 0:
             break
         assert time.time() - t0 < 10, st
@@ -958,12 +1034,12 @@ def test_sleep_does_not_wait_for_writer(monkeypatch):
     assert "server is entering sleeping state" in log.wait_for("server is entering sleeping state", timeout=10)
 
     t0 = time.time()
-    st = cache_status()
+    st = detail()
     assert time.time() - t0 < 1.0
     assert st["sleeping"] is True
     assert st["disk"]["backlog_entries"] == 1
 
-    st = wait_disk("writes", 1)
+    st = wait_disk("persists", 1)
     assert len(entry_files()) == 1
 
 
@@ -978,10 +1054,13 @@ def test_write_error(monkeypatch):
 
     complete(LONG_PROMPT)
     complete(OTHER_PROMPT)
-    st = wait_disk("write_errors", 1)
-    assert st["writes"] == 0
+    st = wait_disk("failures", 1)
+    assert st["persists"] == 0
+    assert st["last_persist"] is None
     assert st["entries"] == 0
     assert st["bytes"] == 0
+    st = disk_detail()
+    assert st["write_errors"] == 1
     assert "No space left on device" in st["last_error"]
     assert glob.glob(os.path.join(server.cache_dir, "*", "*.bin")) == []
     assert glob.glob(os.path.join(server.cache_dir, "*", ".*.tmp")) == []
@@ -1073,7 +1152,8 @@ def test_future_mtime_does_not_wedge_bound(offset):
     for i in range(3):
         complete(conversation(i, 4))
     complete(OTHER_PROMPT) # each conversation is written when the next one takes the slot (delay 0)
-    st = wait_disk("writes", 3)
+    wait_disk("persists", 3)
+    st = disk_detail()
     assert st["writes_no_room"] == 0
     assert st["writes"] == 3
     assert st["removed_evicted"] == 3
@@ -1108,10 +1188,10 @@ def test_active_conversation_written_within_delay():
         for i in range(2):
             convs[i] = grow(convs[i])
             complete0(convs[i])
-        if t_first is None and cache_status()["disk"]["writes"] > 0:
+        if t_first is None and disk()["persists"] > 0:
             t_first = time.time() - t0
         time.sleep(0.2)
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert t_first is not None, st
     assert 2.0 < t_first < 5.0, t_first
     assert st["writes"] >= 2
@@ -1130,7 +1210,7 @@ def test_idle_slot_written_after_delay():
     complete(LONG_PROMPT)
     assert entry_files() == []
     assert "__TEST_TAG_CACHE_STALE_SLOT__" in log.wait_for("__TEST_TAG_CACHE_STALE_SLOT__", timeout=6)
-    st = wait_disk("writes", 1)
+    st = wait_disk("persists", 1)
     assert len(entry_files()) == 1
 
     # the slot still holds the conversation; nothing new to save
@@ -1145,9 +1225,9 @@ def test_idle_slot_written_after_delay():
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
     assert body["timings"]["cache_n"] >= n_long
 
-    res = server.make_request("GET", "/cache")
-    assert res.body["counters"]["hits_disk"] == 1
-    assert res.body["counters"]["hits_ram"] == 1
+    st = detail()
+    assert st["counters"]["hits_disk"] == 1
+    assert st["counters"]["hits_ram"] == 1
 
 
 READ_THROW_ENV = "LLAMA_SERVER_TEST_CACHE_DISK_READ_THROW"
@@ -1173,17 +1253,17 @@ def test_failed_read_of_superseded_entry_is_removed(monkeypatch):
     a = Background(complete, LONG_PROMPT + " A")
     assert "reading disk cache entry" in log.wait_for("reading disk cache entry")
     complete(LONG_PROMPT + " B", cache_prompt=False)
-    wait_disk("writes", 1) # the idle slot save writes B, which supersedes the entry being read
+    wait_disk("persists", 1) # the idle slot save writes B, which supersedes the entry being read
     assert path_long in entry_files()
 
     a.join()
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" not in log.drain()
-    assert "out of memory" in cache_status()["disk"]["last_error"]
+    assert "out of memory" in disk_detail()["last_error"]
     t0 = time.time()
     while path_long in entry_files():
         assert time.time() - t0 < 5, entry_files()
         time.sleep(0.05)
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["removed_superseded"] == 1
     assert st["entries"] == 1
     assert st["bytes"] == sum(os.path.getsize(p) for p in entry_files())
@@ -1216,20 +1296,20 @@ def test_remove_applies_to_its_record(monkeypatch):
     # B supersedes X while it is read: it is written (2 s) once OTHER takes the slot (delay 0)
     complete0(LONG_PROMPT + " B", cache_prompt=False)
     complete0(OTHER_PROMPT, cache_prompt=False)
-    wait_disk("writes", 1)
+    wait_disk("persists", 1)
     # B leaves RAM: a request continues it from RAM, and that conversation is too large for the RAM cache; OTHER is
     # written (2 s)
     complete0(LONG_PROMPT + " B " + " ".join([LONG_PROMPT] * 9))
-    assert cache_status()["ram"]["entries"] == 1 # OTHER
+    assert cache_status()["memory"]["entries"] == 1 # OTHER
     # the slot holds the tokens of X again: X is written again (2 s, after OTHER) once OTHER takes the slot, the read
     # of X ends meanwhile
     complete0(LONG_PROMPT, cache_prompt=False)
     complete0(OTHER_PROMPT, cache_prompt=False)
-    wait_disk("writes", 3)
+    wait_disk("persists", 3)
     a.join()
 
     assert path_x in entry_files()
-    st = cache_status()["disk"]
+    st = disk()
     assert st["entries"] == len(entry_files())
 
     restart()
@@ -1255,7 +1335,7 @@ def test_stalled_writer_drops_without_waiting(monkeypatch):
     complete(OTHER_PROMPT)
     elapsed = time.time() - t0
 
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["backlog_timeouts"] == 1, st
     assert st["backlog_waits"] == 1, st
     assert st["writes_dropped_stalled"] >= 2, st
@@ -1297,7 +1377,7 @@ def test_foreign_files_left_alone(tmp_path):
     server.cache_dir_max = 1 # MiB: the entry of the other key does not fit, it is evicted
     server.start()
 
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["other_entries"] == 0
     assert st["removed_evicted"] == 1
     assert not os.path.exists(ours)
@@ -1308,7 +1388,7 @@ def test_foreign_files_left_alone(tmp_path):
 
     complete(LONG_PROMPT)
     complete(OTHER_PROMPT)
-    wait_disk("writes", 1)
+    wait_disk("persists", 1)
     assert os.path.exists(os.path.join(notes, "0123456789abcdef.bin"))
 
 
@@ -1335,19 +1415,19 @@ def test_resave_of_entry_on_disk_touches_it():
 
     complete0(LONG_PROMPT)
     complete0(OTHER_PROMPT) # LONG is written
-    st = wait_disk("writes", 1)
+    st = wait_disk("persists", 1)
     [path] = entry_files()
     complete0(LONG_PROMPT) # continued from RAM: it leaves RAM for the slot, its file is touched
     time.sleep(0.2)
     t1 = os.path.getmtime(path)
     time.sleep(1.5)
-    n_present = cache_status()["disk"]["writes_present"]
+    n_present = disk_detail()["writes_present"]
     complete0(OTHER_PROMPT) # saved again: already on disk
     t0 = time.time()
     while os.path.getmtime(path) < t1 + 1.0:
         assert time.time() - t0 < 5, (os.path.getmtime(path), t1)
         time.sleep(0.05)
-    assert cache_status()["disk"]["writes_present"] == n_present + 1
+    assert disk_detail()["writes_present"] == n_present + 1
 
 
 # a RAM hit while an entry waits for its delay counts as a use: the file is written with it as its mtime
@@ -1385,7 +1465,7 @@ def test_write_ahead_avoids_backlog_wait(monkeypatch):
     complete(conversation(2, 6)) # 0 and 1 are in RAM, above the mark: both are written ahead
     time.sleep(4)
     complete(OTHER_PROMPT) # 2 is saved: 0 and 1 leave RAM at once
-    st = cache_status()["disk"]
+    st = disk_detail()
     assert st["backlog_waits"] == 0, st
     assert st["writes_ahead"] >= 2, st
     assert st["writes_dropped"] == 0, st

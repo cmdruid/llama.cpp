@@ -32,6 +32,7 @@ It's possible to override some scenario steps values with environment variables:
 | `DEBUG`                  | to enable steps and server verbose mode `--verbose`                                       |
 | `N_GPU_LAYERS`           | number of model layers to offload to VRAM `-ngl --n-gpu-layers`                                |
 | `LLAMA_CACHE`            | by default server tests re-download models to the `tmp` subfolder. Set this to your cache (e.g. `$HOME/Library/Caches/llama.cpp` on Mac or `$HOME/.cache/llama.cpp` on Unix) to avoid this |
+| `LLAMA_SERVER_TEST_HOOKS` | set to `1` when the server is built with `-DLLAMA_SERVER_TEST_HOOKS=ON`: runs the prompt cache tests that inject faults or read the detailed cache status; they are skipped otherwise |
 
 To run slow tests (will download many models, make sure to set `LLAMA_CACHE` if needed):
 

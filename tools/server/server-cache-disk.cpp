@@ -1314,6 +1314,7 @@ struct server_cache_disk::state {
         index_put(e, job.t_used);
 
         st.n_writes++;
+        st.t_last_write     = (int64_t) time(nullptr);
         st.n_bytes_written += job.n_bytes;
         st.t_write_ms      += t_ms;
 

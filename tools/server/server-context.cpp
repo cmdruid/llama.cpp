@@ -1025,7 +1025,33 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
     return true;
 }
 
-static json server_cache_disk_status(const server_cache_disk * cache_disk) {
+// GET /cache: what the prompt cache holds, see "GET /cache" in the README
+// n_live: the slots that hold a conversation; n_memory: the entries of the RAM cache, -1 without one
+// the disk tier's figures are read from its own lock, any thread may call this
+static json server_cache_status(int n_live, int64_t n_memory, const server_cache_disk * cache_disk) {
+    json disk = nullptr;
+    if (cache_disk) {
+        const auto st = cache_disk->stats();
+        disk = {
+            {"entries",      st.n_entries},
+            {"bytes",        st.n_bytes},
+            {"limit_bytes",  st.n_bytes_max},
+            {"persists",     st.n_writes},
+            {"failures",     st.n_write_errors + st.n_write_no_room + st.n_write_dropped},
+            {"last_persist", st.t_last_write > 0 ? json(st.t_last_write) : json(nullptr)},
+        };
+    }
+
+    return json {
+        {"live",   {{"entries", n_live}}},
+        {"memory", n_memory < 0 ? json(nullptr) : json {{"entries", n_memory}}},
+        {"disk",   disk},
+    };
+}
+
+#ifdef LLAMA_SERVER_TEST_HOOKS
+// test builds only: every counter of the disk tier, for tools/server/tests
+static json server_cache_disk_test_status(const server_cache_disk * cache_disk) {
     if (!cache_disk) {
         return nullptr;
     }
@@ -1072,6 +1098,7 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"last_error",      st.last_error},
     };
 }
+#endif
 
 //
 // server_context_impl (private implementation)
@@ -1185,8 +1212,6 @@ private:
     std::map<int, uint64_t> cache_disk_waiting_task;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
-
-    uint64_t cache_persist_count = 0;
 
     server_metrics metrics;
 
@@ -2354,8 +2379,6 @@ private:
         res.ticket = cache_disk ? cache_disk->flush() : 0;
         res.t_ms   = (ggml_time_us() - t_start) / 1000.0;
 
-        cache_persist_count++;
-
         SRV_INF("persist: %d slots saved (%.3f MiB), %d already cached, %d failed, %d busy, %.2f ms\n",
                 res.n_saved, res.n_bytes / (1024.0 * 1024.0), res.n_cached, res.n_failed, res.n_busy, res.t_ms);
 
@@ -2425,6 +2448,14 @@ private:
     }
 
     json cache_status() const {
+        int n_live = 0;
+        for (const auto & slot : slots) {
+            n_live += slot.prompt.tokens.empty() ? 0 : 1;
+        }
+
+        json res = server_cache_status(n_live, prompt_cache ? (int64_t) prompt_cache->states.size() : -1, cache_disk.get());
+
+#ifdef LLAMA_SERVER_TEST_HOOKS
         json slots_data = json::array();
         for (const auto & slot : slots) {
             slots_data.push_back({
@@ -2454,17 +2485,19 @@ private:
                 {"failed_restores", st.n_failed},
                 {"save_ms",         st.t_save_ms},
                 {"load_ms",         st.t_load_ms},
-                {"persists",        cache_persist_count},
             };
         }
 
-        return json {
+        res["test"] = {
             {"ram",      ram},
-            {"disk",     server_cache_disk_status(cache_disk.get())},
+            {"disk",     server_cache_disk_test_status(cache_disk.get())},
             {"waiting",  cache_disk_waiting_task.size()},
             {"counters", counters},
             {"slots",    slots_data},
         };
+#endif
+
+        return res;
     }
 
     // called once the server loop has stopped, before the contexts are destroyed
@@ -6484,15 +6517,18 @@ void server_routes::init_routes() {
     this->get_cache = [this](const server_http_req & req) {
         auto res = create_response(true);
 
-        // the RAM cache and the slots are gone while sleeping, the disk tier is not
+        // the slots and the RAM cache are released while sleeping (the RAM cache's entries are discarded at the
+        // wake-up), the disk tier is not
         if (queue_tasks.is_sleeping()) {
-            res->ok({
-                {"ram",      nullptr},
-                {"disk",     server_cache_disk_status(ctx_server.get_cache_disk())},
-                {"counters", nullptr},
-                {"slots",    json::array()},
+            const auto * disk = ctx_server.get_cache_disk();
+            json data = server_cache_status(0, params.cache_ram_mib != 0 ? 0 : -1, disk);
+#ifdef LLAMA_SERVER_TEST_HOOKS
+            data["test"] = {
+                {"disk",     server_cache_disk_test_status(disk)},
                 {"sleeping", true},
-            });
+            };
+#endif
+            res->ok(data);
             return res;
         }
 
