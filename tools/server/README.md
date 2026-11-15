@@ -171,7 +171,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--cache-dir PATH` | directory of the disk tier of the prompt cache: cache entries are written there and reused after a restart<br/>entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DIR) |
 | `--cache-dir-max N` | size limit of --cache-dir in MiB, all keys together; least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
-| `--cache-dir-delay N` | seconds a prompt cache entry stays in RAM unwritten before it is written to --cache-dir; an entry that a request<br/>continues before then is not written, one that the RAM cache drops is written first (default: 60, 0 = at once)<br/>(env: LLAMA_ARG_CACHE_DIR_DELAY) |
+| `--cache-dir-delay N` | maximum age in seconds of a conversation's progress not yet written to --cache-dir: a prompt cache entry is<br/>written once its oldest unwritten progress is this old, an idle slot is saved and written then too; an entry<br/>that a request continues before then is not written, one that the RAM cache drops is written first (default: 60, 0 = at once)<br/>(env: LLAMA_ARG_CACHE_DIR_DELAY) |
 | `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
@@ -1326,8 +1326,13 @@ reported (`"sleeping": true`). Contains no prompt content.
 The disk writer's counters show the write-behind at work: `backlog_entries`/`backlog_bytes` are the entries not
 written yet (waiting for their `delay_s`, queued or in progress), `writes`/`bytes_written` the entries written,
 `writes_skipped`/`bytes_skipped` the entries a request continued before their delay expired (never written),
-`writes_present` the entries that were already on disk and `writes_no_room` the entries for which the bound left no
-room. `bytes` counts every file under `DIR`, `other_entries`/`other_bytes` the part of it that belongs to other keys.
+`writes_present` the entries that were already on disk (their file is touched instead, `touches` counts the mtime
+updates), `writes_no_room` the entries for which the bound left no room and `writes_ahead` the entries written before
+their delay because the RAM cache was about to drop them. `backlog_waits`/`backlog_wait_ms` count the times the server
+loop waited for the writer, `backlog_timeouts` the waits that ran out (the writer is then taken as stalled),
+`writes_dropped` the entries dropped instead of written, of which `writes_dropped_stalled` without waiting for a stalled
+writer and `writes_dropped_nowait` while going to sleep. `bytes` counts every file under `DIR`,
+`other_entries`/`other_bytes` the part of it that belongs to other keys.
 
 ### POST `/cache/persist`: Save the conversations of the slots to the prompt cache
 
@@ -2676,12 +2681,19 @@ earlier prompt cache:
 the build (number and commit: an upgraded server starts cold), the model and draft model files (size and hashes of their
 first and last MiB), `--override-kv` values, the context size per sequence, unified KV, the K/V types, flash attention
 as resolved (not as requested: `auto` may resolve differently on other hardware), SWA, RoPE settings, LoRA adapters,
-control vectors and the speculative types (the key is written to `IDENTITY`). A state is only loaded by a server with the same key; several keys can share `DIR`
-(one server process at a time: a second process with another key may remove the first one's files to stay within the
-bound, which costs it the entries but nothing else).
+control vectors, the speculative types and, with a draft model, the draft context's resolved flash attention (the key
+is written to `IDENTITY`). A state is only loaded by a server with the same key; several keys can share `DIR`, one
+server process at a time. Two servers running on one `DIR` at once are not supported: each counts the other's entries
+only at its start, so the bound may be exceeded, and one may evict the other's entries (which costs that one its
+entries, nothing else; neither crashes).
+Only what the server writes is ever counted or removed: a subdirectory is a key directory only if it is a real directory
+(a symbolic link is never followed) whose `IDENTITY` starts with the line `format: llama-server prompt cache`, and in a
+key directory only files named `<16 hex digits>.bin` (entries) and `.<16 hex digits>.<pid>.tmp` (writes in progress)
+are counted or removed; anything else is left alone and keeps its directory.
 Files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is removed, never loaded.
-At start-up a temporary file is removed if its process is gone, has the server's own pid or is older than an hour (a
-pid may be reused); the temporary file of a running process is kept and counted in the bound. A read or write that
+At start-up a temporary file is removed if its process is gone, has the server's own pid and is older than the server
+process (a previous process with that pid; another server in another pid namespace may have the same pid), or is older
+than an hour (a pid may be reused); the temporary file of a running process is kept and counted in the bound. A read or write that
 fails, for lack of memory as well, fails that entry only; the sizes in a file are checked against its length, and a
 file larger than the bound is never read.
 An entry whose file is gone (removed by hand, or with the directory) is dropped from the index when it is next read or
@@ -2697,29 +2709,58 @@ still gets its state.
 **Bound.** `--cache-dir-max` bounds `DIR` as a whole, across keys: at start-up the server also counts the entries of the
 other keys (from their sizes and mtimes) and evicts them like its own, least recently used first, so a stale key (after
 a model update or a context change) gives its space back; a key directory left without entries is removed. The last use
-of an entry is the time it was saved to RAM or restored (its file's mtime), not the time of its write, and a new entry
-evicts only entries used less recently than itself, so the order in which the writer works does not change which
-entries stay. When a conversation grows, the entry it replaces makes room first. The entries of live conversations and those being read are
-not evicted; if they leave no room for a new entry, its write is skipped (`writes_no_room`) and it stays in RAM. During
+of an entry is the last time it was saved to RAM or restored, from RAM or from disk (its file's mtime, updated without
+a rewrite when an entry on disk is saved again), not the time of its write, and a new entry evicts only entries used
+less recently than itself, so the order in which the writer works does not change which entries stay. A last use is
+never later than the present: an mtime in the future (the clock was stepped back, files were restored) counts as now,
+so such entries are evicted like the others instead of filling the bound. When a conversation grows, the entry it replaces makes room first. The entries of live conversations and those being read are
+not evicted; if they leave no room for a new entry, its write is skipped (`writes_no_room`) and it stays in RAM, where
+it is lost once the RAM cache drops it (it is not written again). During
 a write, the entries it supersedes stay on disk until it completes. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
 
-**Write-behind.** An entry is not written when it is saved to RAM, but when one of these happens first:
-- it has stayed in the RAM cache unwritten for `--cache-dir-delay` seconds (default 60; 0 writes it at once);
+**Write-behind.** `--cache-dir-delay` is the maximum age of a conversation's progress that is not on disk. An entry is
+not written when it is saved to RAM, but when one of these happens first:
+- its oldest unwritten progress is `--cache-dir-delay` seconds old (default 60; 0 writes it at once). That age starts
+  when a slot starts a task on its conversation after the conversation was last saved; an entry that a request continues before it is written
+  leaves RAM for the slot and is not written (`writes_skipped`), but the slot keeps the age of its progress, and so
+  does the entry its next save creates. A conversation in constant use is therefore written at most
+  `--cache-dir-delay` seconds after its first unwritten turn, then the age starts again with its next turn;
+- a conversation that stays in its slot has no entry: an idle slot whose progress is `--cache-dir-delay` seconds old is
+  saved to the RAM cache and written (it keeps its conversation). This is checked when no slot is processing, at least
+  once a second; the save copies the state on the server loop (a fraction of a second for a large context), so it is
+  never done while a slot is processing, and a request that arrives meanwhile waits for it. With
+  `--cache-dir-delay 0` a live slot is written only when it is saved for another reason;
+- the RAM cache holds more than 80 % of `--cache-ram`: its two least recently used entries (more if dropping those
+  would not bring it back to 80 %) are written ahead of their delay (`writes_ahead`), so that the entry the RAM cache
+  drops next is usually on disk already;
 - the RAM cache drops it to stay within `--cache-ram`: the writer keeps its memory until it is written. To bound that
   memory to one entry beyond `--cache-ram`, the server waits for the writer before it hands it another such entry
   (`backlog_waits`, `backlog_wait_ms`, `released_entries`/`released_bytes` in `GET /cache`); if the writer does not
-  keep up within `--cache-persist-timeout`, the entry is dropped instead (`writes_dropped`);
+  keep up within `--cache-persist-timeout`, the entry is dropped instead (`writes_dropped`, `backlog_timeouts`), and
+  until the writer finishes a write the next such entries are dropped without waiting (`writes_dropped_stalled`), so a
+  hung disk stops the server loop once, not at every eviction. Going to sleep never waits: such an entry is dropped
+  (`writes_dropped_nowait`). With write-ahead these waits and drops are rare: they need entries dropped from RAM
+  faster than the writer writes them;
 - `POST /cache/persist`, a graceful shutdown or going to sleep: everything not written yet is written, the most
-  recently saved first, within `--cache-persist-timeout` (going to sleep does not wait for it).
+  recently saved first (after the entries the RAM cache dropped or is about to drop), within `--cache-persist-timeout`
+  (going to sleep does not wait for it).
 
-An entry that a request continues before its delay expires leaves RAM for the slot and is never written: an active
-conversation is written once it pauses for the delay, not after every turn. A copy already on disk (the entry was read
-from disk, or written earlier) stays until the continuation is written and supersedes it. A crash (SIGKILL, power
-loss) therefore loses at most the progress of the conversations during the last `--cache-dir-delay` seconds (they
-resume from their previous copy on disk, or cold) and what is live in the slots; a graceful stop loses nothing that
-fits in `--cache-persist-timeout`. A request that is cancelled while it waits for a disk read releases the read: its
-state is not kept (`waiting` in `GET /cache` counts the requests waiting for a read, `disk.loaded` the reads not taken
-yet).
+The cost of the delay: a conversation in constant use is written about once per `--cache-dir-delay`, the whole entry
+each time. With the default of 60 s and entries of 2–6 GiB that is up to 6 GiB per minute per active conversation
+(about 2.5–3.3 s of the writer's time, off the server loop); a disk with limited write endurance may prefer a longer
+delay (300 s writes a fifth of that), at the price of a larger loss on a crash.
+
+A copy already on disk (the entry was read from disk, or written earlier) stays until the continuation is written and
+supersedes it. A crash (SIGKILL, power loss) loses exactly what is not on disk: for each conversation, its progress
+since its last written copy (it resumes from that copy, or cold). That progress is at most `--cache-dir-delay` seconds
+old plus the time the writer needs for the writes queued before it, except for the progress of a slot whose
+conversation stays in it while some slot is processing without a pause (it is saved only when no slot is processing or
+when it leaves the slot), and for entries that are not written at all: those for which the bound left no room
+(`writes_no_room`), whose write failed (`write_errors`), that were dropped (`writes_dropped`), prompts with media and
+states larger than `--cache-ram`; with `--cache-dir-delay 0`, also the progress of a live slot since it was last saved.
+A graceful stop loses nothing that fits in `--cache-persist-timeout`. A request that is cancelled while it waits for a
+disk read releases the read: its state is not kept (`waiting` in `GET /cache` counts the requests waiting for a read,
+`disk.loaded` the reads not taken yet).
 
 ## Sleeping on Idle
 
