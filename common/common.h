@@ -665,6 +665,7 @@ struct common_params {
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
     std::string cache_dir;                   // disk tier of the prompt cache, empty = disabled
     int32_t cache_dir_max_mib   = 32768; // size limit of the disk tier in MiB
+    int32_t cache_dir_delay     = 60;    // seconds an entry stays in RAM unwritten before it is written to the disk tier
     int32_t cache_persist_timeout = 30;  // seconds to persist the slots to the disk tier at shutdown and before sleep
 
     // llama-connect params

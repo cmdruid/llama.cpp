@@ -169,8 +169,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
-| `--cache-dir PATH` | directory of the disk tier of the prompt cache: every cache entry is also written there and reused after a restart<br/>entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DIR) |
+| `--cache-dir PATH` | directory of the disk tier of the prompt cache: cache entries are written there and reused after a restart<br/>entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DIR) |
 | `--cache-dir-max N` | size limit of the disk tier of the prompt cache in MiB, least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
+| `--cache-dir-delay N` | seconds a prompt cache entry stays in RAM unwritten before it is written to --cache-dir; an entry that a request<br/>continues before then is not written, one that the RAM cache drops is written first (default: 60, 0 = at once)<br/>(env: LLAMA_ARG_CACHE_DIR_DELAY) |
 | `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
@@ -1322,10 +1323,16 @@ counters (`saves`, `hits_ram`, `hits_disk`, `misses`, `evictions_ram`, `failed_r
 cumulated save and load times, and the length of each slot's conversation. While the server sleeps, only `disk` is
 reported (`"sleeping": true`). Contains no prompt content.
 
+The disk writer's counters show the write-behind at work: `backlog_entries`/`backlog_bytes` are the entries not
+written yet (waiting for their `delay_s`, queued or in progress), `writes`/`bytes_written` the entries written,
+`writes_skipped`/`bytes_skipped` the entries a request continued before their delay expired (never written),
+`writes_present` the entries that were already on disk and `writes_no_room` the entries larger than the bound.
+
 ### POST `/cache/persist`: Save the conversations of the slots to the prompt cache
 
-Saves the conversation of every non-empty slot to the prompt cache and, with `--cache-dir`, waits until the disk
-writer has written it (at most `--cache-persist-timeout` seconds). A slot that is processing a task is saved as it
+Saves the conversation of every non-empty slot to the prompt cache and, with `--cache-dir`, writes every entry not on
+disk yet, the most recently saved first, and waits until the disk writer is done (at most `--cache-persist-timeout`
+seconds). A slot that is processing a task is saved as it
 stands between two decoding steps (counted in `n_busy`); the task is not interrupted. A gateway calls this before it
 stops the server; the server does the same on a graceful shutdown (SIGTERM) and before it goes to sleep.
 
@@ -2627,8 +2634,8 @@ Example of an error:
 ## Prompt cache
 
 With `--cache-ram` (default 8192 MiB) the server keeps the state of conversations that leave a slot in RAM, and a
-later request that continues one restores it instead of re-processing its prompt. With `--cache-dir DIR` every entry
-is also written to disk by a background thread, so conversations beyond `--cache-ram` stay resumable and survive a
+later request that continues one restores it instead of re-processing its prompt. With `--cache-dir DIR` the entries
+are also written to disk by a background thread, so conversations beyond `--cache-ram` stay resumable and survive a
 restart. No session or slot id is needed: a conversation is recognized by the tokens it starts with.
 
 **Matching.** A conversation's protected prefix runs to the end of its last message that is not the assistant's (all
@@ -2653,6 +2660,19 @@ entry is read in the background (other requests are not blocked), then it is res
 kept. An entry superseded by a newer one while it is being read is removed when the read ends; the waiting request
 still gets its state. The directory is bounded by `--cache-dir-max`, least recently used first; the entries of live
 conversations are not evicted. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
+
+**Write-behind.** An entry is not written when it is saved to RAM, but when one of these happens first:
+- it has stayed in the RAM cache unwritten for `--cache-dir-delay` seconds (default 60; 0 writes it at once);
+- the RAM cache drops it to stay within `--cache-ram`: the writer keeps its memory until it is written;
+- `POST /cache/persist`, a graceful shutdown or going to sleep: everything not written yet is written, the most
+  recently saved first, within `--cache-persist-timeout`.
+
+An entry that a request continues before its delay expires leaves RAM for the slot and is never written: an active
+conversation is written once it pauses for the delay, not after every turn. A copy already on disk (the entry was read
+from disk, or written earlier) stays until the continuation is written and supersedes it. A crash (SIGKILL, power
+loss) therefore loses at most the progress of the conversations during the last `--cache-dir-delay` seconds (they
+resume from their previous copy on disk, or cold) and what is live in the slots; a graceful stop loses nothing that
+fits in `--cache-persist-timeout`.
 
 ## Sleeping on Idle
 

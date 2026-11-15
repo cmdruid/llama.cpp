@@ -1033,11 +1033,14 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"entries",         st.n_entries},
         {"bytes",           st.n_bytes},
         {"limit_bytes",     st.n_bytes_max},
+        {"delay_s",         st.t_delay_ms / 1000.0},
         {"backlog_entries", st.n_backlog},
         {"backlog_bytes",   st.n_backlog_bytes},
         {"loading",         st.n_loading},
         {"writes",          st.n_writes},
         {"writes_skipped",  st.n_write_skipped},
+        {"writes_present",  st.n_write_present},
+        {"writes_no_room",  st.n_write_no_room},
         {"write_errors",    st.n_write_errors},
         {"reads",           st.n_reads},
         {"read_errors",     st.n_read_errors},
@@ -1045,6 +1048,7 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"removed_evicted",    st.n_removed_evicted},
         {"removed_superseded", st.n_removed_superseded},
         {"bytes_written",   st.n_bytes_written},
+        {"bytes_skipped",   st.n_bytes_skipped},
         {"bytes_read",      st.n_bytes_read},
         {"write_ms",        st.t_write_ms},
         {"read_ms",         st.t_read_ms},
@@ -2132,6 +2136,7 @@ private:
         }
 
         cache_disk = server_cache_disk::open(params_base.cache_dir, name, key, (size_t) params_base.cache_dir_max_mib*1024*1024,
+            (int64_t) params_base.cache_dir_delay*1000,
             [this](uint64_t) {
                 // called from the reader thread
                 server_task task(SERVER_TASK_TYPE_CACHE_LOADED);
@@ -2264,7 +2269,7 @@ private:
         uint64_t ticket   = 0; // the disk writes to wait for
     };
 
-    // save the conversation of every non-empty slot to the prompt cache, which writes it to disk
+    // save the conversation of every non-empty slot to the prompt cache and write every entry not on disk yet
     // a slot that is processing a task is saved as it stands: between two decoding steps its tokens and its state agree
     cache_persist_result cache_persist() {
         cache_persist_result res;
@@ -2305,7 +2310,8 @@ private:
         cache_update_metrics();
         cache_disk_update_live();
 
-        res.ticket = cache_disk ? cache_disk->ticket() : 0;
+        // everything not on disk yet is written now, the slots just saved first
+        res.ticket = cache_disk ? cache_disk->flush() : 0;
         res.t_ms   = (ggml_time_us() - t_start) / 1000.0;
 
         cache_persist_count++;

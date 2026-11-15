@@ -250,10 +250,7 @@ struct ckpt_meta {
 
 // what the writer needs of a cache entry: copies of the small parts, shared references to the large ones
 struct write_job {
-    enum type_t { WRITE, TOUCH, REMOVE } type = WRITE;
-
-    uint64_t seq = 0;
-    uint64_t id  = 0;
+    uint64_t id = 0;
 
     llama_tokens tokens;
     int32_t      n_protected = 0;
@@ -263,6 +260,23 @@ struct write_job {
     std::shared_ptr<const server_prompt_data> data;
 
     size_t n_bytes = 0; // the size of the file
+};
+
+// a write that waits for its delay, see server_cache_disk::stage()
+struct staged_write {
+    write_job job;
+
+    int64_t  t_staged_ms = 0;
+    int64_t  t_due_ms    = 0;
+    uint64_t flush       = 0;     // the flush that wants it written, 0 = none
+    bool     released    = false; // the RAM cache dropped the entry: the writer holds its only copy
+};
+
+// a small file operation of the writer, done in order before the writes
+struct file_op {
+    enum type_t { TOUCH, REMOVE } type = TOUCH;
+
+    uint64_t id = 0;
 };
 
 struct loaded_entry {
@@ -286,6 +300,8 @@ struct server_cache_disk::state {
     std::string dir;
     uint64_t    key_hash = 0;
     size_t      n_bytes_max = 0;
+
+    int64_t     t_delay_ms  = 0;
 
     std::function<void(uint64_t)> on_loaded;
 
@@ -311,11 +327,13 @@ struct server_cache_disk::state {
     std::set<uint64_t>            loading;     // reads requested or in progress
     std::deque<uint64_t>          load_queue;
     std::map<uint64_t, std::shared_ptr<loaded_entry>> loaded;
-    std::deque<write_job>         jobs;
-    std::set<uint64_t>            jobs_pending; // ids of the queued writes
-    size_t                        jobs_bytes = 0;
-    uint64_t                      seq_queued = 0;
-    uint64_t                      seq_done   = 0;
+    std::map<uint64_t, staged_write> staged;   // the writes not started yet
+    size_t                        staged_bytes = 0;
+    std::deque<file_op>           ops;
+    uint64_t                      cur_id    = 0; // the write in progress, 0 = none
+    uint64_t                      cur_flush = 0;
+    size_t                        cur_bytes = 0;
+    uint64_t                      flush_seq = 0;
     bool                          stopping   = false;
     bool                          writer_exited = false;
     bool                          reader_exited = false;
@@ -804,14 +822,14 @@ struct server_cache_disk::state {
 
             if (index.count(job.id) && !index.at(job.id).removing) {
                 index_touch(job.id, time_now_ns());
-                st.n_write_skipped++;
+                st.n_write_present++;
                 return;
             }
 
             if (job.n_bytes > n_bytes_max) {
                 DSK_WRN("entry %s (%.3f MiB) is larger than the disk cache limit (%.3f MiB), skipping\n",
                         hex64(job.id).c_str(), job.n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0));
-                st.n_write_skipped++;
+                st.n_write_no_room++;
                 return;
             }
 
@@ -886,43 +904,108 @@ struct server_cache_disk::state {
 #endif
     }
 
+    // the next write to do: one that the RAM cache released first (it holds memory the RAM cache no longer counts),
+    // then the most recently saved entry, so that a deadline loses the least valuable ones
+    std::map<uint64_t, staged_write>::iterator pick_locked(int64_t t_now) {
+        auto res = staged.end();
+        for (auto it = staged.begin(); it != staged.end(); ++it) {
+            const auto & w = it->second;
+            if (!(stopping || w.released || w.flush != 0 || w.t_due_ms <= t_now)) {
+                continue;
+            }
+            if (res == staged.end()) {
+                res = it;
+                continue;
+            }
+            const auto & b = res->second;
+            if (w.released != b.released ? w.released : (w.released ? w.t_staged_ms < b.t_staged_ms : w.t_staged_ms > b.t_staged_ms)) {
+                res = it;
+            }
+        }
+        return res;
+    }
+
+    // until when the writer may sleep
+    int64_t t_next_due_locked() const {
+        int64_t res = INT64_MAX;
+        for (const auto & [id, w] : staged) {
+            res = std::min(res, w.t_due_ms);
+        }
+        return res;
+    }
+
     void writer_loop() {
         while (true) {
+            std::unique_lock<std::mutex> lock(mtx);
+
+            file_op op;
+            bool    has_op = false;
             write_job job;
-            {
-                std::unique_lock<std::mutex> lock(mtx);
-                cv_jobs.wait(lock, [&] { return stopping || !jobs.empty(); });
-                if (jobs.empty() || abort.load()) {
+
+            while (true) {
+                if (abort.load()) {
                     break;
                 }
-                job = std::move(jobs.front());
-                jobs.pop_front();
+                if (!ops.empty()) {
+                    op = ops.front();
+                    ops.pop_front();
+                    has_op = true;
+                    break;
+                }
+                const int64_t t_now = ggml_time_ms();
+                if (auto it = pick_locked(t_now); it != staged.end()) {
+                    job = std::move(it->second.job);
+                    cur_id    = it->first;
+                    cur_flush = it->second.flush;
+                    cur_bytes = job.n_bytes;
+                    staged_bytes -= job.n_bytes;
+                    staged.erase(it);
+                    break;
+                }
+                if (stopping && staged.empty()) {
+                    break;
+                }
+                const int64_t t_due = t_next_due_locked();
+                if (t_due == INT64_MAX) {
+                    cv_jobs.wait(lock);
+                } else {
+                    cv_jobs.wait_for(lock, std::chrono::milliseconds(std::max<int64_t>(1, t_due - t_now)));
+                }
             }
 
-            switch (job.type) {
-                case write_job::WRITE:
-                    process_write(job);
-                    break;
-                case write_job::TOUCH:
-                    {
+            if (!has_op && cur_id == 0) {
+                break;
+            }
+
+            lock.unlock();
+
+            if (has_op) {
+                switch (op.type) {
+                    case file_op::TOUCH:
+                        {
 #ifndef _WIN32
-                        // the mtime keeps the LRU order across restarts
-                        utimensat(AT_FDCWD, path_of(job.id).c_str(), nullptr, 0);
+                            // the mtime keeps the LRU order across restarts
+                            utimensat(AT_FDCWD, path_of(op.id).c_str(), nullptr, 0);
 #endif
-                    } break;
-                case write_job::REMOVE:
-                    unlink_files({ path_of(job.id) });
-                    break;
+                        } break;
+                    case file_op::REMOVE:
+                        unlink_files({ path_of(op.id) });
+                        break;
+                }
+                continue;
             }
 
-            {
-                std::unique_lock<std::mutex> lock(mtx);
-                if (job.type == write_job::WRITE) {
-                    jobs_pending.erase(job.id);
-                    jobs_bytes -= job.n_bytes;
-                }
-                seq_done = job.seq;
-            }
+            process_write(job);
+
+            // release the data before waking up the waiters
+            job = write_job();
+
+            lock.lock();
+            cur_id    = 0;
+            cur_flush = 0;
+            cur_bytes = 0;
+            lock.unlock();
+
             cv_done.notify_all();
         }
 
@@ -1074,12 +1157,14 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
         const std::string & key_name,
         const std::string & key,
         size_t n_bytes_max,
+        int64_t t_delay_ms,
         std::function<void(uint64_t)> on_loaded) {
 #ifdef _WIN32
     GGML_UNUSED(dir_root);
     GGML_UNUSED(key_name);
     GGML_UNUSED(key);
     GGML_UNUSED(n_bytes_max);
+    GGML_UNUSED(t_delay_ms);
     GGML_UNUSED(on_loaded);
     DSK_ERR("%s", "the disk prompt cache is not supported on Windows\n");
     return nullptr;
@@ -1122,6 +1207,7 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     s.dir         = dir;
     s.key_hash    = key_hash;
     s.n_bytes_max = n_bytes_max;
+    s.t_delay_ms  = t_delay_ms;
     s.on_loaded   = std::move(on_loaded);
 
     if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS")) {
@@ -1170,8 +1256,9 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
 
     state::unlink_files(files);
 
-    DSK_INF("disk prompt cache in '%s': %zu entries, %.3f MiB (limit %.3f MiB), indexed in %.2f ms\n",
-            dir.c_str(), s.index.size(), s.n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+    DSK_INF("disk prompt cache in '%s': %zu entries, %.3f MiB (limit %.3f MiB), write delay %.1f s, indexed in %.2f ms\n",
+            dir.c_str(), s.index.size(), s.n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0), t_delay_ms / 1000.0,
+            (ggml_time_us() - t_start) / 1000.0);
 
     auto sp = res->st;
     s.writer = std::thread([sp]() { sp->writer_loop(); });
@@ -1185,49 +1272,113 @@ server_cache_disk::~server_cache_disk() {
     stop(0);
 }
 
-uint64_t server_cache_disk::write(const server_prompt_cache_state & state) {
+// the id of an entry that can be written: text only, with a state
+static bool disk_entry_id(const server_prompt_cache_state & state, llama_tokens & tokens, uint64_t & id) {
     // media chunks are not written, their tokens are placeholders
+    if (!state.data || !server_cache_disk_text_tokens(state.prompt.tokens, tokens) || tokens.empty()) {
+        return false;
+    }
+    id = server_cache_disk_hash_tokens(tokens);
+    return true;
+}
+
+void server_cache_disk::stage_locked(const server_prompt_cache_state & state, bool released) {
     llama_tokens tokens;
-    const bool text_only = server_cache_disk_text_tokens(state.prompt.tokens, tokens);
-
-    std::unique_lock<std::mutex> lock(st->mtx);
-
-    if (st->stopping || !text_only || tokens.empty() || !state.data) {
-        return st->seq_queued;
+    uint64_t id = 0;
+    if (st->stopping || !disk_entry_id(state, tokens, id)) {
+        return;
     }
 
-    const uint64_t id = server_cache_disk_hash_tokens(tokens);
-
-    if (st->jobs_pending.count(id)) {
-        return st->seq_queued;
+    if (auto it = st->staged.find(id); it != st->staged.end()) {
+        it->second.released = it->second.released || released;
+        return;
     }
 
-    write_job job;
-    job.type        = write_job::WRITE;
-    job.seq         = ++st->seq_queued;
-    job.id          = id;
-    job.tokens      = std::move(tokens);
-    job.n_protected = state.prompt.n_protected;
-    job.pos_min     = state.pos_min;
-    job.data        = state.data;
+    if (id == st->cur_id) {
+        return;
+    }
+
+    if (st->index.count(id) && !st->is_removing_locked(id)) {
+        st->index_touch(id, time_now_ns());
+        st->st.n_write_present++;
+        return;
+    }
+
+    staged_write w;
+    w.job.id          = id;
+    w.job.n_protected = state.prompt.n_protected;
+    w.job.pos_min     = state.pos_min;
+    w.job.data        = state.data;
 
     size_t n_payload = state.data->main.size() + state.data->drft.size();
     for (const auto & c : state.prompt.checkpoints) {
-        job.ckpts.push_back(c);
+        w.job.ckpts.push_back(c);
         n_payload += c->data_tgt.size() + c->data_dft.size() + c->data_spec.size();
     }
-    job.n_bytes = file_size_of(tokens.size(), job.ckpts.size(), n_payload);
+    w.job.n_bytes = file_size_of(tokens.size(), w.job.ckpts.size(), n_payload);
+    w.job.tokens  = std::move(tokens);
 
-    st->jobs_pending.insert(id);
-    st->jobs_bytes += job.n_bytes;
-    st->jobs.push_back(std::move(job));
+    w.t_staged_ms = ggml_time_ms();
+    w.t_due_ms    = released ? w.t_staged_ms : w.t_staged_ms + st->t_delay_ms;
+    w.released    = released;
 
-    const uint64_t seq = st->seq_queued;
+    st->staged_bytes += w.job.n_bytes;
+    st->staged.emplace(id, std::move(w));
+}
+
+void server_cache_disk::stage(const server_prompt_cache_state & state) {
+    {
+        std::unique_lock<std::mutex> lock(st->mtx);
+        stage_locked(state, false);
+    }
+    st->cv_jobs.notify_all();
+}
+
+void server_cache_disk::drop(uint64_t id) {
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    auto it = st->staged.find(id);
+    if (it == st->staged.end() || it->second.released) {
+        return;
+    }
+
+    DSK_DBG("entry %s left the RAM cache before it was written, not writing it\n", hex64(id).c_str());
+
+    st->st.n_write_skipped++;
+    st->st.n_bytes_skipped += it->second.job.n_bytes;
+    st->staged_bytes       -= it->second.job.n_bytes;
+    st->staged.erase(it);
 
     lock.unlock();
+    st->cv_done.notify_all();
+}
+
+void server_cache_disk::release(const server_prompt_cache_state & state) {
+    {
+        std::unique_lock<std::mutex> lock(st->mtx);
+        stage_locked(state, true);
+    }
+    st->cv_jobs.notify_all();
+}
+
+uint64_t server_cache_disk::flush() {
+    uint64_t ticket;
+    {
+        std::unique_lock<std::mutex> lock(st->mtx);
+
+        ticket = ++st->flush_seq;
+        for (auto & [id, w] : st->staged) {
+            if (w.flush == 0) {
+                w.flush = ticket;
+            }
+        }
+        if (st->cur_id != 0 && st->cur_flush == 0) {
+            st->cur_flush = ticket;
+        }
+    }
     st->cv_jobs.notify_all();
 
-    return seq;
+    return ticket;
 }
 
 std::vector<server_cache_disk::entry_ptr> server_cache_disk::entries() const {
@@ -1301,12 +1452,7 @@ void server_cache_disk::touch(uint64_t id) {
     }
 
     st->index_touch(id, time_now_ns());
-
-    write_job job;
-    job.type = write_job::TOUCH;
-    job.seq  = ++st->seq_queued;
-    job.id   = id;
-    st->jobs.push_back(std::move(job));
+    st->ops.push_back({ file_op::TOUCH, id });
 
     lock.unlock();
     st->cv_jobs.notify_all();
@@ -1332,11 +1478,7 @@ void server_cache_disk::remove(uint64_t id) {
         return;
     }
 
-    write_job job;
-    job.type = write_job::REMOVE;
-    job.seq  = ++st->seq_queued;
-    job.id   = id;
-    st->jobs.push_back(std::move(job));
+    st->ops.push_back({ file_op::REMOVE, id });
 
     lock.unlock();
     st->cv_jobs.notify_all();
@@ -1347,16 +1489,20 @@ void server_cache_disk::set_live(std::vector<llama_tokens> conversations) {
     st->live = std::move(conversations);
 }
 
-uint64_t server_cache_disk::ticket() const {
-    std::unique_lock<std::mutex> lock(st->mtx);
-    return st->seq_queued;
-}
-
 bool server_cache_disk::wait(uint64_t ticket, int64_t timeout_ms) const {
+    const auto flushed = [&] {
+        const auto wanted = [&](uint64_t flush) { return flush != 0 && flush <= ticket; };
+        if (st->cur_id != 0 && wanted(st->cur_flush)) {
+            return false;
+        }
+        return std::none_of(st->staged.begin(), st->staged.end(), [&](const auto & w) { return wanted(w.second.flush); });
+    };
+
     std::unique_lock<std::mutex> lock(st->mtx);
-    return st->cv_done.wait_for(lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)), [&] {
-        return st->seq_done >= ticket || st->writer_exited;
-    }) && st->seq_done >= ticket;
+    st->cv_done.wait_for(lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)), [&] {
+        return flushed() || st->writer_exited;
+    });
+    return flushed();
 }
 
 void server_cache_disk::stop(int64_t timeout_ms) {
@@ -1384,8 +1530,8 @@ void server_cache_disk::stop(int64_t timeout_ms) {
     {
         std::unique_lock<std::mutex> lock(st->mtx);
         ok = st->cv_done.wait_for(lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)), exited);
-        if (!ok && !st->jobs_pending.empty()) {
-            DSK_WRN("abandoning %zu queued writes (%.3f MiB)\n", st->jobs_pending.size(), st->jobs_bytes / (1024.0 * 1024.0));
+        if (!ok && !st->staged.empty()) {
+            DSK_WRN("abandoning %zu queued writes (%.3f MiB)\n", st->staged.size(), st->staged_bytes / (1024.0 * 1024.0));
         }
     }
 
@@ -1416,8 +1562,9 @@ server_cache_disk_stats server_cache_disk::stats() const {
     res.n_entries       = st->index.size();
     res.n_bytes         = st->n_bytes;
     res.n_bytes_max     = st->n_bytes_max;
-    res.n_backlog       = st->jobs_pending.size();
-    res.n_backlog_bytes = st->jobs_bytes;
+    res.n_backlog       = st->staged.size() + (st->cur_id != 0 ? 1 : 0);
+    res.n_backlog_bytes = st->staged_bytes + st->cur_bytes;
+    res.t_delay_ms      = st->t_delay_ms;
     res.n_loading       = st->loading.size();
     return res;
 }

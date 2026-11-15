@@ -1809,6 +1809,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (it->prompt.is_continued_by(prompt.tokens)) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", it->prompt.n_tokens());
 
+            if (disk) {
+                disk->drop(it->id);
+            }
+
             it = states.erase(it);
         } else {
             ++it;
@@ -1821,8 +1825,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
-            stats.n_evictions++;
+            evict_oldest();
         }
     }
 
@@ -2001,6 +2004,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best->prompt.is_continued_by(tokens_new)) {
         // the slot continues this conversation and will be saved again before it is truncated, so the entry is not needed
         // (a copy on disk stays until the slot's conversation is written and supersedes it)
+        if (disk) {
+            disk->drop(it_best->id);
+        }
+
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
@@ -2021,8 +2028,18 @@ void server_prompt_cache::on_saved(const server_prompt_cache_state & state) {
     stats.n_saves++;
 
     if (disk) {
-        disk->write(state);
+        disk->stage(state);
     }
+}
+
+void server_prompt_cache::evict_oldest() {
+    // the disk writer keeps the state until it is written
+    if (disk) {
+        disk->release(states.front());
+    }
+
+    states.pop_front();
+    stats.n_evictions++;
 }
 
 bool server_prompt_cache::contains(uint64_t id) const {
@@ -2084,8 +2101,7 @@ bool server_prompt_cache::insert(server_prompt_cache_state && state) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
-            stats.n_evictions++;
+            evict_oldest();
         }
     }
 
@@ -2101,6 +2117,9 @@ void server_prompt_cache::erase(uint64_t id) {
     }
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->id == id) {
+            if (disk) {
+                disk->drop(id);
+            }
             states.erase(it);
             return;
         }
@@ -2112,8 +2131,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
-            stats.n_evictions++;
+            evict_oldest();
         }
     }
 
@@ -2128,8 +2146,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
-            stats.n_evictions++;
+            evict_oldest();
         }
     }
 

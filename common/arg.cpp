@@ -1702,7 +1702,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--cache-dir"}, "PATH",
-        "directory of the disk tier of the prompt cache: every cache entry is also written there and reused after a restart\n"
+        "directory of the disk tier of the prompt cache: cache entries are written there and reused after a restart\n"
         "entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.cache_dir = value;
@@ -1718,6 +1718,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_dir_max_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DIR_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-dir-delay"}, "N",
+        string_format("seconds a prompt cache entry stays in RAM unwritten before it is written to --cache-dir; an entry that a request\n"
+                      "continues before then is not written, one that the RAM cache drops is written first (default: %d, 0 = at once)", params.cache_dir_delay),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-dir-delay must be non-negative");
+            }
+            params.cache_dir_delay = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR_DELAY").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-persist-timeout"}, "N",
         string_format("seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: %d)", params.cache_persist_timeout),

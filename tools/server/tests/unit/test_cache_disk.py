@@ -43,6 +43,8 @@ def create_server(tmp_path):
     server.temperature = 0.0
     server.cache_ram = 100
     server.cache_dir = str(tmp_path / "cache")
+    # write-through unless a test checks the write delay
+    server.cache_dir_delay = 0
     server.debug = True
     fd, server.log_path = tempfile.mkstemp(suffix='.log')
     os.close(fd)
@@ -374,7 +376,7 @@ def test_metrics():
 
     complete(LONG_PROMPT)
     complete(OTHER_PROMPT)
-    wait_entries(1)
+    wait_disk("writes", 1)
 
     res = server.make_request("GET", "/metrics")
     assert res.status_code == 200
@@ -481,3 +483,140 @@ def test_superseded_while_loading(monkeypatch):
     assert st["entries"] == len(entry_files())
     assert st["bytes"] <= st["limit_bytes"]
     assert server.process.poll() is None
+
+
+def wait_disk(key, value, timeout=10.0):
+    t0 = time.time()
+    while True:
+        st = cache_status()["disk"]
+        if st[key] >= value:
+            return st
+        assert time.time() - t0 < timeout, f"expected disk {key} >= {value}, got {st}"
+        time.sleep(0.05)
+
+
+# write-behind: a conversation resumed before its delay is not written, the next one waits in RAM
+def test_resumed_before_delay_is_not_written():
+    global server
+    server.cache_dir_delay = 60
+    server.start()
+
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT) # LONG goes to the RAM cache
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert body["timings"]["cache_n"] >= n_tokens(LONG_PROMPT)
+
+    st = cache_status()["disk"]
+    assert st["writes"] == 0
+    assert st["writes_skipped"] == 1
+    assert st["bytes_skipped"] > 0
+    assert st["backlog_entries"] == 1 # OTHER waits for its delay
+    assert entry_files() == []
+
+
+# write-behind: an entry is written once it has stayed in RAM for the delay
+def test_written_after_delay():
+    global server
+    server.cache_dir_delay = 2
+    server.start()
+
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT)
+    t0 = time.time()
+    assert cache_status()["disk"]["backlog_entries"] == 1
+    assert entry_files() == []
+
+    wait_disk("writes", 1)
+    assert time.time() - t0 > 1.5
+    assert len(entry_files()) == 1
+    assert cache_status()["disk"]["backlog_entries"] == 0
+
+
+# write-behind: an entry that the RAM cache drops to stay within its limit is written at once
+def test_ram_eviction_writes():
+    global server
+    server.cache_dir_delay = 60
+    server.cache_ram = 1 # MiB, about two of these conversations
+    server.start()
+
+    for i in range(4):
+        complete(conversation(i, 4))
+    complete(OTHER_PROMPT)
+
+    # the two oldest left RAM, the others wait for their delay
+    st = wait_disk("writes", 2)
+    assert st["writes"] == 2
+    assert st["backlog_entries"] == 2
+    assert cache_status()["counters"]["evictions_ram"] == 2
+
+    # they are read back from disk
+    log = LogReader(server.log_path)
+    log.drain()
+    body = complete(conversation(0, 4) + " The end.")
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
+    assert body["timings"]["cache_n"] > 0
+
+
+# write-behind: a persist writes everything not written yet, the most recently saved first
+def test_persist_writes_everything():
+    global server
+    server.cache_dir_delay = 60
+    server.start()
+    log = LogReader(server.log_path)
+
+    for i in range(3):
+        complete(conversation(i, 1))
+    slot = conversation(9, 2)
+    complete(slot)
+    assert cache_status()["disk"]["backlog_entries"] == 3
+    log.drain()
+
+    res = server.make_request("POST", "/cache/persist")
+    assert res.status_code == 200
+    assert res.body["flushed"] is True
+    assert res.body["n_saved"] == 1
+    assert len(entry_files()) == 4
+    st = cache_status()["disk"]
+    assert st["writes"] == 4 and st["backlog_entries"] == 0
+
+    # the slot was saved last: it is written first
+    wrote = [l for l in log.drain().splitlines() if "wrote entry" in l]
+    assert len(wrote) == 4
+    assert f"{n_tokens(slot) + 4} tokens" in wrote[0] or f"{n_tokens(slot) + 3} tokens" in wrote[0]
+
+
+# --cache-dir-delay 0 writes an entry as soon as it is saved, a resumed conversation keeps its copy
+def test_delay_zero_is_write_through():
+    global server
+    server.cache_dir_delay = 0
+    server.start()
+
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT)
+    wait_disk("writes", 1)
+    path = entry_files()[0]
+
+    complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    st = cache_status()["disk"]
+    assert st["writes_skipped"] == 0
+    assert path in entry_files()
+
+
+# a conversation read from disk and continued keeps its disk copy until the continuation is written
+def test_disk_copy_kept_until_continuation_written():
+    global server
+    server.cache_dir_delay = 60
+    server.start()
+
+    complete(LONG_PROMPT)
+    restart() # persists the slot
+    path = entry_files()[0]
+
+    complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    complete(OTHER_PROMPT) # the continuation goes to RAM, waiting for its delay
+    assert entry_files() == [path]
+
+    res = server.make_request("POST", "/cache/persist")
+    assert res.status_code == 200 and res.body["flushed"]
+    assert path not in entry_files()
+    assert cache_status()["disk"]["removed_superseded"] == 1

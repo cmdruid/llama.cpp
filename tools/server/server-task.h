@@ -848,8 +848,11 @@ struct server_prompt_cache {
         double   t_load_ms    = 0.0;
     } stats;
 
-    // the entry was completed by saving a slot: write it to disk
+    // the entry was completed by saving a slot: the disk tier writes it after its delay
     void on_saved(const server_prompt_cache_state & state);
+
+    // drop the oldest entry to stay within the limits, the disk tier writes it first
+    void evict_oldest();
 
     // the disk entry the request reuses most, if it reuses more than n_floor tokens and is not in RAM already
     std::shared_ptr<const server_cache_disk_entry> find_disk(const server_tokens & tokens_new, int32_t n_floor) const;

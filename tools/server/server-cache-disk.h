@@ -16,9 +16,14 @@
 
 // disk tier of the prompt cache (--cache-dir)
 //
-// every prompt cache entry is also written to <dir>/<key>/<id>.bin by a background writer thread, and entries found
-// there at start-up are indexed (tokens, checkpoint positions and sizes, not the states), so that a conversation
-// survives a restart and conversations beyond --cache-ram stay resumable
+// prompt cache entries are written to <dir>/<key>/<id>.bin by a background writer thread, and entries found there at
+// start-up are indexed (tokens, checkpoint positions and sizes, not the states), so that a conversation survives a
+// restart and conversations beyond --cache-ram stay resumable
+//
+// write-behind: an entry saved to the RAM cache is written once it has stayed there unwritten for --cache-dir-delay
+// seconds, when the RAM cache drops it to stay within its limits (the writer then holds its memory until it is
+// written), or when a flush asks for everything (persist, shutdown, sleep); an entry that leaves the RAM cache before
+// its delay because a slot continues it is not written (a later save of the slot supersedes it)
 //
 // - <key> names everything that shapes a saved state (model and draft files, context and KV settings), so a state is
 //   never loaded into an engine that would not have computed it, see server_context_impl::cache_disk_identity()
@@ -49,12 +54,16 @@ struct server_cache_disk_stats {
     size_t n_bytes   = 0;
     size_t n_bytes_max = 0;
 
-    size_t n_backlog       = 0; // writes queued or in progress
+    size_t n_backlog       = 0; // entries not written yet: waiting for their delay, queued or in progress
     size_t n_backlog_bytes = 0;
     size_t n_loading       = 0; // reads in progress
 
+    int64_t t_delay_ms = 0;
+
     uint64_t n_writes        = 0;
-    uint64_t n_write_skipped = 0; // already on disk, or larger than the bound
+    uint64_t n_write_skipped = 0; // left the RAM cache (a slot continued them) before they were written
+    uint64_t n_write_present = 0; // already on disk
+    uint64_t n_write_no_room = 0; // larger than the bound
     uint64_t n_write_errors  = 0;
     uint64_t n_reads         = 0;
     uint64_t n_read_errors   = 0;
@@ -63,6 +72,7 @@ struct server_cache_disk_stats {
     uint64_t n_removed_superseded = 0;
 
     uint64_t n_bytes_written = 0;
+    uint64_t n_bytes_skipped = 0; // the size of the writes skipped because the entry left the RAM cache
     uint64_t n_bytes_read    = 0;
     double   t_write_ms = 0.0; // total
     double   t_read_ms  = 0.0; // total
@@ -96,15 +106,24 @@ struct server_cache_disk {
             const std::string & key_name,
             const std::string & key,
             size_t n_bytes_max,
+            int64_t t_delay_ms,
             std::function<void(uint64_t)> on_loaded);
 
     ~server_cache_disk();
 
     const std::string & dir() const { return path_dir; }
 
-    // queue an entry of the prompt cache for writing, unless it is already on disk
-    // returns the ticket of the write, see wait()
-    uint64_t write(const server_prompt_cache_state & state);
+    // an entry was saved to the RAM cache: write it after the delay, unless it is already on disk
+    void stage(const server_prompt_cache_state & state);
+
+    // the entry left the RAM cache because a slot continues it (or a newer entry contains it): do not write it
+    void drop(uint64_t id);
+
+    // the RAM cache drops the entry to stay within its limits: write it now, unless it is already on disk
+    void release(const server_prompt_cache_state & state);
+
+    // write every entry not written yet, the most recently saved first; returns the ticket for wait()
+    uint64_t flush();
 
     // the index, for matching requests
     std::vector<entry_ptr> entries() const;
@@ -125,13 +144,10 @@ struct server_cache_disk {
     // the conversations of the slots: the entries they continue are not evicted
     void set_live(std::vector<llama_tokens> conversations);
 
-    // the ticket of the last write queued so far
-    uint64_t ticket() const;
-
-    // wait until the writes up to `ticket` are done; false on timeout
+    // wait until the entries flushed by `ticket` are written (or dropped); false on timeout
     bool wait(uint64_t ticket, int64_t timeout_ms) const;
 
-    // stop the threads: finish the queued writes within timeout_ms, then abandon the rest
+    // stop the threads: write the entries not written yet within timeout_ms, then abandon the rest
     // never blocks much longer than timeout_ms, even if a write is stuck in the kernel
     void stop(int64_t timeout_ms);
 
@@ -141,6 +157,8 @@ struct server_cache_disk {
 
 private:
     server_cache_disk() = default;
+
+    void stage_locked(const server_prompt_cache_state & state, bool released);
 
     std::string path_dir;
 
