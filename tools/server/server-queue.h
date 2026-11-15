@@ -66,6 +66,9 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // move the deferred task with this id to the front of the main queue, if it is still deferred
+    void pop_deferred_task_by_id(int id_task);
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     // the server then stays awake until the caller calls release_inflight()

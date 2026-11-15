@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-cache-disk.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1799,6 +1800,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                     states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
+            stats.n_evictions++;
         }
     }
 
@@ -1822,16 +1824,23 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     states.push_back({
-        /*.prompt =*/ {
+        /*.prompt  =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
             /*.n_protected =*/ prompt.n_protected,
         },
-        /*.data   =*/ {
+        /*.data    =*/ std::make_shared<server_prompt_data>(server_prompt_data {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
-        },
+        }),
+        /*.pos_min =*/ 0,
+        /*.id      =*/ 0,
     });
+
+    // prompts with media chunks are not identified, they are never written to disk
+    if (llama_tokens tokens; server_cache_disk_text_tokens(prompt.tokens, tokens)) {
+        states.back().id = server_cache_disk_hash_tokens(tokens);
+    }
 
     return &states.back();
 }
@@ -1875,6 +1884,16 @@ int32_t server_prompt_cache::n_usable(const server_prompt & prompt, llama_pos po
     return n_past;
 }
 
+int32_t server_prompt_cache::n_candidate(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const {
+    const int32_t n_cur = n_usable(prompt, pos_min, tokens_new);
+
+    if (8*n_cur < prompt.n_tokens() && !prompt.is_continued_by(tokens_new)) {
+        return 0;
+    }
+
+    return n_cur;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     // what the slot already offers to the request
     int32_t n_best = n_usable(prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new);
@@ -1886,7 +1905,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     // an entry is a candidate only if the request continues it up to a usable restore point (see n_usable)
     // the entry that keeps the most tokens wins, the most recent one on a tie
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int32_t n_cur = n_usable(it->prompt, it->pos_min, tokens_new);
+        const int32_t n_cur = n_candidate(it->prompt, it->pos_min, tokens_new);
 
         SRV_TRC("   - prompt with length %7d, usable = %7d, continued = %d\n", it->prompt.n_tokens(), n_cur, it->prompt.is_continued_by(tokens_new));
 
@@ -1894,71 +1913,176 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        // restoring a large state to reuse a small part of it costs more than it saves,
-        // unless the request continues that conversation
-        if (8*n_cur < it->prompt.n_tokens() && !it->prompt.is_continued_by(tokens_new)) {
-            continue;
-        }
-
         n_best  = n_cur;
         it_best = it;
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with length %d, usable = %d\n", it_best->prompt.n_tokens(), n_best);
+    if (it_best == states.end()) {
+        if (n_best == 0) {
+            stats.n_misses++;
+        }
+        return true;
+    }
 
-        {
-            const auto & data = it_best->data.main;
+    SRV_TRC(" - found better prompt with length %d, usable = %d\n", it_best->prompt.n_tokens(), n_best);
+
+    const int64_t t_start = ggml_time_us();
+
+    {
+        const auto & data = it_best->data->main;
+
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("failed to restore state with size %zu\n", size);
+
+            id_failed = it_best->id;
+            stats.n_failed++;
+
+            return false;
+        }
+    }
+
+    {
+        const auto & data = it_best->data->drft;
+
+        if (!data.empty()) {
+            GGML_ASSERT(ctx_dft);
 
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_WRN("failed to restore state with size %zu\n", size);
+
+                id_failed = it_best->id;
+                stats.n_failed++;
 
                 return false;
             }
         }
+    }
 
-        {
-            const auto & data = it_best->data.drft;
+    stats.n_hits_ram++;
+    stats.t_load_ms += (ggml_time_us() - t_start) / 1000.0;
 
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+    SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
 
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+    // the whole cached prompt is a prefix of the new one
+    if (it_best->prompt.tokens.get_common_prefix(tokens_new) == it_best->prompt.tokens.size()) {
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+    }
 
-                    return false;
-                }
-            }
-        }
+    if (disk) {
+        disk->touch(it_best->id);
+    }
 
-        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+    if (it_best->prompt.is_continued_by(tokens_new)) {
+        // the slot continues this conversation and will be saved again before it is truncated, so the entry is not needed
+        // (a copy on disk stays until the slot's conversation is written and supersedes it)
+        prompt = std::move(it_best->prompt);
 
-        // the whole cached prompt is a prefix of the new one
-        if (it_best->prompt.tokens.get_common_prefix(tokens_new) == it_best->prompt.tokens.size()) {
-            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
-        }
+        states.erase(it_best);
+    } else {
+        // the request branches off this conversation: keep the entry, the slot gets a copy
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_KEEP__\n");
 
-        if (it_best->prompt.is_continued_by(tokens_new)) {
-            // the slot continues this conversation and will be saved again before it is truncated, so the entry is not needed
-            prompt = std::move(it_best->prompt);
+        prompt = it_best->prompt.clone();
 
-            states.erase(it_best);
-        } else {
-            // the request branches off this conversation: keep the entry, the slot gets a copy
-            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_KEEP__\n");
-
-            prompt = it_best->prompt.clone();
-
-            // most recently used
-            states.splice(states.end(), states, it_best);
-        }
+        // most recently used
+        states.splice(states.end(), states, it_best);
     }
 
     return true;
+}
+
+void server_prompt_cache::on_saved(const server_prompt_cache_state & state) {
+    stats.n_saves++;
+
+    if (disk) {
+        disk->write(state);
+    }
+}
+
+bool server_prompt_cache::contains(uint64_t id) const {
+    if (id == 0) {
+        return false;
+    }
+    for (const auto & state : states) {
+        if (state.id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int32_t server_prompt_cache::n_best(const server_tokens & tokens_new) const {
+    int32_t res = 0;
+    for (const auto & state : states) {
+        res = std::max(res, n_candidate(state.prompt, state.pos_min, tokens_new));
+    }
+    return res;
+}
+
+std::shared_ptr<const server_cache_disk_entry> server_prompt_cache::find_disk(const server_tokens & tokens_new, int32_t n_floor) const {
+    if (!disk) {
+        return nullptr;
+    }
+
+    std::shared_ptr<const server_cache_disk_entry> res;
+
+    for (const auto & e : disk->entries()) {
+        const int32_t n_cur = n_candidate(e->prompt, e->pos_min, tokens_new);
+        if (n_cur <= n_floor || (res && n_cur <= n_candidate(res->prompt, res->pos_min, tokens_new))) {
+            continue;
+        }
+        if (contains(e->id)) {
+            continue;
+        }
+        res = e;
+    }
+
+    return res;
+}
+
+bool server_prompt_cache::insert(server_prompt_cache_state && state) {
+    const size_t n = state.size();
+
+    if (limit_size > 0 && n > limit_size) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                n / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return false;
+    }
+
+    if (contains(state.id)) {
+        return true;
+    }
+
+    if (limit_size > 0) {
+        while (!states.empty() && size() + n > limit_size) {
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
+            stats.n_evictions++;
+        }
+    }
+
+    states.push_back(std::move(state));
+    stats.n_hits_disk++;
+
+    return true;
+}
+
+void server_prompt_cache::erase(uint64_t id) {
+    if (id == 0) {
+        return;
+    }
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->id == id) {
+            states.erase(it);
+            return;
+        }
+    }
 }
 
 void server_prompt_cache::update() {
@@ -1967,6 +2091,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
+            stats.n_evictions++;
         }
     }
 
@@ -1982,6 +2107,7 @@ void server_prompt_cache::update() {
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
+            stats.n_evictions++;
         }
     }
 

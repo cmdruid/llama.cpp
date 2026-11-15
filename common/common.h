@@ -663,6 +663,8 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    std::string cache_dir;                   // disk tier of the prompt cache, empty = disabled
+    int32_t cache_dir_max_mib   = 32768; // size limit of the disk tier in MiB
 
     // llama-connect params
     bool        server_connect      = false;

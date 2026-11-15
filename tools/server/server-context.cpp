@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-cache-disk.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -353,13 +354,15 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t_start = ggml_time_us();
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
 
-        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data->main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data->drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         if (n_tgt != cur_size_tgt || n_dft != cur_size_dft) {
             SLT_ERR(*this, "%s", "failed to save complete prompt state\n");
             prompt_cache.states.pop_back();
@@ -367,6 +370,11 @@ struct server_slot {
         }
 
         cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
+
+        prompt_cache.stats.t_save_ms += (ggml_time_us() - t_start) / 1000.0;
+
+        // the entry is complete: from here on its data is not modified, the disk writer may share it
+        prompt_cache.on_saved(*cur);
 
         return true;
     }
@@ -1114,6 +1122,12 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // disk tier of the prompt cache, kept across sleep, see server-cache-disk.h
+    std::unique_ptr<server_cache_disk> cache_disk;
+
+    // the tasks deferred until a disk cache entry is read: task id -> entry id, 0 once the read is done
+    std::map<int, uint64_t> cache_disk_waiting_task;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1606,9 +1620,26 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, n_swa);
+            auto prompt_cache_new = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, n_swa);
+
+            // the counters survive sleep, the entries are discarded (they are on disk if the disk tier is on)
+            if (prompt_cache) {
+                prompt_cache_new->stats = prompt_cache->stats;
+            }
+
+            prompt_cache = std::move(prompt_cache_new);
+
+            if (!params_base.cache_dir.empty() && !cache_disk) {
+                cache_disk_open();
+            }
+
+            prompt_cache->disk = cache_disk.get();
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+
+            if (!params_base.cache_dir.empty()) {
+                SRV_WRN("%s", "--cache-dir requires --cache-ram, the disk prompt cache is disabled\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1905,6 +1936,19 @@ private:
 
                 if (!ok) {
                     ret->prompt_clear();
+
+                    // without other slots holding cells, the state does not fit this context: drop the entry
+                    const bool busy = std::any_of(slots.begin(), slots.end(), [&](const server_slot & s) {
+                        return s.id != ret->id && s.prompt.n_tokens() > 0;
+                    });
+                    if (prompt_cache->id_failed != 0 && !(params_base.kv_unified && busy)) {
+                        SLT_WRN(*ret, "%s", "dropping the prompt cache entry that failed to restore\n");
+                        prompt_cache->erase(prompt_cache->id_failed);
+                        if (cache_disk) {
+                            cache_disk->remove(prompt_cache->id_failed);
+                        }
+                    }
+                    prompt_cache->id_failed = 0;
                 }
             }
 
@@ -1971,6 +2015,184 @@ private:
         }
 
         return res;
+    }
+
+    // everything that shapes a saved state, see server-cache-disk.h
+    // an entry is only loaded by an engine with the same key, so a state is never used by an engine that would not have computed it
+    std::string cache_disk_identity() const {
+        std::ostringstream ss;
+        ss.precision(9);
+
+        const auto files = [](const common_params_model & m) {
+            std::string res;
+            for (const auto & path : m.get_paths()) {
+                res += server_cache_disk_file_identity(path) + ";";
+            }
+            return res;
+        };
+
+        char buf[256];
+
+        ss << "format: llama-server prompt cache 1, llama state seq " << LLAMA_STATE_SEQ_VERSION << "\n";
+
+        buf[0] = 0;
+        llama_model_meta_val_str(model_tgt, "general.architecture", buf, sizeof(buf));
+        ss << "arch: " << buf << "\n";
+        llama_model_desc(model_tgt, buf, sizeof(buf));
+        ss << "model: " << buf << ", " << llama_model_n_params(model_tgt) << " params, " << llama_model_size(model_tgt) << " bytes\n";
+        ss << "model files: " << files(params_base.model) << "\n";
+
+        ss << "context: n_ctx_seq " << llama_n_ctx_seq(ctx_tgt) << ", n_stream " << (params_base.kv_unified ? 1 : params_base.n_parallel)
+           << ", kv_unified " << params_base.kv_unified << ", swa_full " << params_base.swa_full << ", n_swa " << n_swa
+           << ", flash_attn " << (int) params_base.flash_attn_type << "\n";
+        ss << "kv types: " << ggml_type_name(params_base.cache_type_k) << " " << ggml_type_name(params_base.cache_type_v) << "\n";
+        ss << "rope: scaling " << (int) params_base.rope_scaling_type << ", freq_base " << params_base.rope_freq_base
+           << ", freq_scale " << params_base.rope_freq_scale << ", yarn " << params_base.yarn_ext_factor << " " << params_base.yarn_attn_factor
+           << " " << params_base.yarn_beta_fast << " " << params_base.yarn_beta_slow << " " << params_base.yarn_orig_ctx << "\n";
+
+        for (const auto & la : params_base.lora_adapters) {
+            ss << "lora: " << server_cache_disk_file_identity(la.path) << ", scale " << la.scale << "\n";
+        }
+        for (const auto & cv : params_base.control_vectors) {
+            ss << "control vector: " << server_cache_disk_file_identity(cv.fname) << ", strength " << cv.strength << "\n";
+        }
+        if (!params_base.control_vectors.empty()) {
+            ss << "control vector layers: " << params_base.control_vector_layer_start << " " << params_base.control_vector_layer_end << "\n";
+        }
+
+        ss << "speculative:";
+        for (const auto type : params_base.speculative.types) {
+            ss << " " << common_speculative_type_to_str(type);
+        }
+        ss << "\n";
+
+        if (ctx_dft) {
+            const auto & draft = params_base.speculative.draft;
+            ss << "draft files: " << (params_base.speculative.has_dft() ? files(draft.mparams) : std::string("none")) << "\n";
+            ss << "draft context: n_ctx " << llama_n_ctx(ctx_dft) << ", kv types " << ggml_type_name(draft.cache_type_k) << " " << ggml_type_name(draft.cache_type_v) << "\n";
+        }
+
+        return ss.str();
+    }
+
+    void cache_disk_open() {
+        const std::string key = cache_disk_identity();
+
+        // the subdirectory is named by the architecture and the hash of the key
+        char arch[64] = "model";
+        llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
+        std::string name;
+        for (const char * c = arch; *c; ++c) {
+            name += isalnum((unsigned char) *c) || *c == '-' || *c == '_' ? *c : '_';
+        }
+
+        cache_disk = server_cache_disk::open(params_base.cache_dir, name, key, (size_t) params_base.cache_dir_max_mib*1024*1024,
+            [this](uint64_t) {
+                // called from the reader thread
+                server_task task(SERVER_TASK_TYPE_CACHE_LOADED);
+                task.id = queue_tasks.get_new_id();
+                queue_tasks.post(std::move(task));
+            });
+
+        if (!cache_disk) {
+            SRV_ERR("%s", "failed to open the disk prompt cache, continuing without it\n");
+        }
+    }
+
+    // if a disk cache entry that is not in RAM offers the request more than the RAM cache and the idle slots, read it
+    // in the background and defer the task until it is in RAM: the server loop does not wait for the disk
+    // returns true if the task must be deferred
+    bool cache_disk_prefetch(const server_task & task) {
+        if (!cache_disk || !prompt_cache || task.is_stateless() || task.is_child() || !task.params.cache_prompt) {
+            return false;
+        }
+
+        // a task waits for one read at most
+        if (auto it = cache_disk_waiting_task.find(task.id); it != cache_disk_waiting_task.end()) {
+            if (it->second != 0) {
+                return true; // still reading
+            }
+            cache_disk_waiting_task.erase(it);
+            return false;
+        }
+
+        int32_t n_floor = prompt_cache->n_best(task.tokens);
+        for (auto & slot : slots) {
+            if (slot.is_processing() || (task.id_slot != -1 && slot.id != task.id_slot)) {
+                continue;
+            }
+            n_floor = std::max(n_floor, prompt_cache->n_usable(slot.prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), task.tokens));
+        }
+
+        const auto e = prompt_cache->find_disk(task.tokens, n_floor);
+        if (!e) {
+            return false;
+        }
+
+        if (!cache_disk->load_async(e->id)) {
+            return false;
+        }
+
+        SRV_INF("task %d: reading disk cache entry with %d tokens (%.3f MiB), it offers %d tokens instead of %d\n",
+                task.id, e->prompt.n_tokens(), e->n_bytes / (1024.0 * 1024.0), prompt_cache->n_candidate(e->prompt, e->pos_min, task.tokens), n_floor);
+
+        cache_disk_waiting_task[task.id] = e->id;
+
+        return true;
+    }
+
+    // a disk cache entry was read: add it to the RAM cache and resume the tasks waiting for it
+    void cache_disk_loaded() {
+        if (!cache_disk) {
+            return;
+        }
+
+        std::set<uint64_t> ids;
+        for (const auto & [id_task, id] : cache_disk_waiting_task) {
+            if (id != 0) {
+                ids.insert(id);
+            }
+        }
+
+        for (const uint64_t id : ids) {
+            server_prompt_cache_state state;
+            const auto res = cache_disk->take_loaded(id, state, mctx != nullptr);
+            if (res == server_cache_disk::LOAD_PENDING) {
+                continue;
+            }
+
+            if (res == server_cache_disk::LOAD_OK && prompt_cache) {
+                if (prompt_cache->insert(std::move(state))) {
+                    SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__\n");
+                    prompt_cache->update();
+                }
+            }
+
+            for (auto & [id_task, id_cur] : cache_disk_waiting_task) {
+                if (id_cur == id) {
+                    id_cur = 0;
+                    queue_tasks.pop_deferred_task_by_id(id_task);
+                }
+            }
+        }
+    }
+
+    // the disk cache entries that the slots continue are not evicted
+    // the writer checks them when it evicts, an entry written after this call is protected as well
+    void cache_disk_update_live() {
+        if (!cache_disk) {
+            return;
+        }
+
+        std::vector<llama_tokens> live;
+        for (const auto & slot : slots) {
+            const server_tokens & tokens = slot.is_processing() && slot.task ? slot.task->tokens : slot.prompt.tokens;
+            if (llama_tokens text; !tokens.empty() && server_cache_disk_text_tokens(tokens, text)) {
+                live.push_back(std::move(text));
+            }
+        }
+
+        cache_disk->set_live(std::move(live));
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -3084,6 +3306,12 @@ private:
 
                     const int id_task = task.id;
 
+                    if (cache_disk_prefetch(task)) {
+                        SRV_DBG("waiting for the disk cache, defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -3139,6 +3367,12 @@ private:
                             }
                         }
                     }
+
+                    cache_disk_update_live();
+                } break;
+            case SERVER_TASK_TYPE_CACHE_LOADED:
+                {
+                    cache_disk_loaded();
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {

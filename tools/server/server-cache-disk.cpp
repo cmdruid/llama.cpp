@@ -1,0 +1,1360 @@
+#include "server-cache-disk.h"
+
+#include "log.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstring>
+#include <filesystem>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+#define DSK_INF(fmt, ...) LOG_INF("disk %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define DSK_WRN(fmt, ...) LOG_WRN("disk %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define DSK_ERR(fmt, ...) LOG_ERR("disk %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define DSK_DBG(fmt, ...) LOG_DBG("disk %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+
+//
+// hashing (XXH64)
+//
+
+namespace {
+
+constexpr uint64_t XXH_P1 = 11400714785074694791ULL;
+constexpr uint64_t XXH_P2 = 14029467366897019727ULL;
+constexpr uint64_t XXH_P3 =  1609587929392839161ULL;
+constexpr uint64_t XXH_P4 =  9650029242287828579ULL;
+constexpr uint64_t XXH_P5 =  2870177450012600261ULL;
+
+inline uint64_t xxh_rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+inline uint64_t xxh_rd64(const uint8_t * p) { uint64_t v; memcpy(&v, p, 8); return v; }
+inline uint32_t xxh_rd32(const uint8_t * p) { uint32_t v; memcpy(&v, p, 4); return v; }
+
+inline uint64_t xxh_round(uint64_t acc, uint64_t in) {
+    acc += in * XXH_P2;
+    acc  = xxh_rotl(acc, 31);
+    return acc * XXH_P1;
+}
+
+inline uint64_t xxh_merge(uint64_t acc, uint64_t v) {
+    acc ^= xxh_round(0, v);
+    return acc * XXH_P1 + XXH_P4;
+}
+
+struct xxh64 {
+    uint64_t v[4];
+    uint64_t seed;
+    uint64_t total = 0;
+    uint8_t  buf[32];
+    size_t   n_buf = 0;
+
+    explicit xxh64(uint64_t seed = 0) : seed(seed) {
+        v[0] = seed + XXH_P1 + XXH_P2;
+        v[1] = seed + XXH_P2;
+        v[2] = seed;
+        v[3] = seed - XXH_P1;
+    }
+
+    void stripe(const uint8_t * p) {
+        v[0] = xxh_round(v[0], xxh_rd64(p +  0));
+        v[1] = xxh_round(v[1], xxh_rd64(p +  8));
+        v[2] = xxh_round(v[2], xxh_rd64(p + 16));
+        v[3] = xxh_round(v[3], xxh_rd64(p + 24));
+    }
+
+    void update(const void * data, size_t len) {
+        const uint8_t * p = (const uint8_t *) data;
+        total += len;
+        if (n_buf + len < 32) {
+            memcpy(buf + n_buf, p, len);
+            n_buf += len;
+            return;
+        }
+        if (n_buf > 0) {
+            const size_t k = 32 - n_buf;
+            memcpy(buf + n_buf, p, k);
+            stripe(buf);
+            p   += k;
+            len -= k;
+            n_buf = 0;
+        }
+        while (len >= 32) {
+            stripe(p);
+            p   += 32;
+            len -= 32;
+        }
+        if (len > 0) {
+            memcpy(buf, p, len);
+            n_buf = len;
+        }
+    }
+
+    uint64_t digest() const {
+        uint64_t h;
+        if (total >= 32) {
+            h = xxh_rotl(v[0], 1) + xxh_rotl(v[1], 7) + xxh_rotl(v[2], 12) + xxh_rotl(v[3], 18);
+            h = xxh_merge(h, v[0]);
+            h = xxh_merge(h, v[1]);
+            h = xxh_merge(h, v[2]);
+            h = xxh_merge(h, v[3]);
+        } else {
+            h = seed + XXH_P5;
+        }
+        h += total;
+
+        const uint8_t * p = buf;
+        size_t len = n_buf;
+        while (len >= 8) {
+            h ^= xxh_round(0, xxh_rd64(p));
+            h  = xxh_rotl(h, 27) * XXH_P1 + XXH_P4;
+            p += 8; len -= 8;
+        }
+        if (len >= 4) {
+            h ^= (uint64_t) xxh_rd32(p) * XXH_P1;
+            h  = xxh_rotl(h, 23) * XXH_P2 + XXH_P3;
+            p += 4; len -= 4;
+        }
+        while (len > 0) {
+            h ^= (*p) * XXH_P5;
+            h  = xxh_rotl(h, 11) * XXH_P1;
+            p++; len--;
+        }
+        h ^= h >> 33; h *= XXH_P2;
+        h ^= h >> 29; h *= XXH_P3;
+        h ^= h >> 32;
+        return h;
+    }
+};
+
+std::string hex64(uint64_t v) {
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016" PRIx64, v);
+    return buf;
+}
+
+int64_t time_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+} // namespace
+
+uint64_t server_cache_disk_hash(const void * data, size_t size, uint64_t seed) {
+    xxh64 h(seed);
+    h.update(data, size);
+    return h.digest();
+}
+
+uint64_t server_cache_disk_hash_tokens(const llama_tokens & tokens) {
+    return server_cache_disk_hash(tokens.data(), tokens.size()*sizeof(llama_token), 0x4c535043);
+}
+
+bool server_cache_disk_text_tokens(const server_tokens & tokens, llama_tokens & out) {
+    out = tokens.get_text_tokens();
+    return out.size() == tokens.size();
+}
+
+//
+// file format, version 1 (little-endian)
+//
+//   header (96 bytes):
+//     u32 magic "LSPC", u32 version, u64 key hash, u64 id (hash of the tokens), u64 n_tokens, i64 n_protected,
+//     i64 pos_min, u64 n_checkpoints, u64 size of the main state, u64 size of the draft state, u64 size of the meta
+//     section, u64 size of the file, u64 hash of the header (without this field) and of the meta section
+//   meta:
+//     the tokens (i32 each), then per checkpoint: i64 n_tokens, i32 pos_min, i32 pos_max,
+//     u64 size of the target, draft and speculative data
+//   payload:
+//     the main state, the draft state, then the target, draft and speculative data of each checkpoint
+//   trailer (16 bytes):
+//     u64 hash of the payload, u32 magic "CPSL", u32 0
+//
+// the payload is the output of llama_state_seq_get_data_ext() as kept by the RAM cache, so it is only
+// valid for the engine that computed it - the key directory guarantees that
+//
+
+static constexpr uint32_t DISK_MAGIC     = 0x4350534c; // "LSPC"
+static constexpr uint32_t DISK_MAGIC_END = 0x4c535043; // "CPSL"
+static constexpr uint32_t DISK_VERSION   = 1;
+
+static constexpr size_t DISK_HEADER_SIZE  = 96;
+static constexpr size_t DISK_CKPT_SIZE    = 40;
+static constexpr size_t DISK_TRAILER_SIZE = 16;
+
+static constexpr size_t DISK_IO_CHUNK = 64ull*1024*1024;
+
+namespace {
+
+struct byte_writer {
+    std::vector<uint8_t> buf;
+
+    template <typename T>
+    void put(T v) {
+        const size_t n = buf.size();
+        buf.resize(n + sizeof(T));
+        memcpy(buf.data() + n, &v, sizeof(T));
+    }
+
+    void put_raw(const void * p, size_t n) {
+        buf.insert(buf.end(), (const uint8_t *) p, (const uint8_t *) p + n);
+    }
+};
+
+struct byte_reader {
+    const uint8_t * p;
+    size_t n;
+    size_t off = 0;
+
+    template <typename T>
+    bool get(T & v) {
+        if (off + sizeof(T) > n) {
+            return false;
+        }
+        memcpy(&v, p + off, sizeof(T));
+        off += sizeof(T);
+        return true;
+    }
+};
+
+struct file_header {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t key_hash;
+    uint64_t id;
+    uint64_t n_tokens;
+    int64_t  n_protected;
+    int64_t  pos_min;
+    uint64_t n_ckpt;
+    uint64_t size_main;
+    uint64_t size_drft;
+    uint64_t size_meta;
+    uint64_t size_total;
+    uint64_t meta_hash;
+};
+
+struct ckpt_meta {
+    int64_t  n_tokens;
+    int32_t  pos_min;
+    int32_t  pos_max;
+    uint64_t size_tgt;
+    uint64_t size_dft;
+    uint64_t size_spec;
+};
+
+// what the writer needs of a cache entry: copies of the small parts, shared references to the large ones
+struct write_job {
+    enum type_t { WRITE, TOUCH, REMOVE } type = WRITE;
+
+    uint64_t seq = 0;
+    uint64_t id  = 0;
+
+    llama_tokens tokens;
+    int32_t      n_protected = 0;
+    llama_pos    pos_min     = 0;
+
+    std::vector<std::shared_ptr<const common_prompt_checkpoint>> ckpts;
+    std::shared_ptr<const server_prompt_data> data;
+
+    size_t n_bytes = 0; // the size of the file
+};
+
+struct loaded_entry {
+    bool ok = false;
+
+    llama_tokens tokens;
+    int32_t      n_protected = 0;
+    llama_pos    pos_min     = 0;
+
+    std::vector<std::shared_ptr<common_prompt_checkpoint>> ckpts;
+    std::shared_ptr<server_prompt_data> data;
+};
+
+size_t file_size_of(size_t n_tokens, size_t n_ckpt, size_t n_payload) {
+    return DISK_HEADER_SIZE + n_tokens*sizeof(llama_token) + n_ckpt*DISK_CKPT_SIZE + n_payload + DISK_TRAILER_SIZE;
+}
+
+} // namespace
+
+struct server_cache_disk::state {
+    std::string dir;
+    uint64_t    key_hash = 0;
+    size_t      n_bytes_max = 0;
+
+    std::function<void(uint64_t)> on_loaded;
+
+    mutable std::mutex mtx;
+    mutable std::condition_variable cv_jobs;   // writer and reader wait for work
+    mutable std::condition_variable cv_done;   // wait() and stop() wait for progress
+
+    // guarded by mtx
+    std::map<uint64_t, entry_ptr> index;
+    std::map<uint64_t, int64_t>   t_used;      // last use, ns since epoch
+    size_t                        n_bytes = 0; // sum of the indexed file sizes
+    std::vector<llama_tokens>     live;        // the conversations of the slots
+    std::set<uint64_t>            loading;     // reads requested or in progress
+    std::deque<uint64_t>          load_queue;
+    std::map<uint64_t, std::shared_ptr<loaded_entry>> loaded;
+    std::deque<write_job>         jobs;
+    std::set<uint64_t>            jobs_pending; // ids of the queued writes
+    size_t                        jobs_bytes = 0;
+    uint64_t                      seq_queued = 0;
+    uint64_t                      seq_done   = 0;
+    bool                          stopping   = false;
+    bool                          writer_exited = false;
+    bool                          reader_exited = false;
+    server_cache_disk_stats       st;
+
+    // set when the remaining writes must be abandoned, checked between I/O chunks
+    std::atomic<bool> abort { false };
+
+    // held while on_loaded() runs, so that stop() can wait for a callback in progress
+    std::mutex mtx_callback;
+
+    std::string path_of(uint64_t id) const {
+        return dir + "/" + hex64(id) + ".bin";
+    }
+
+    // the oldest entries that are neither live nor loading, until n_needed more bytes fit
+    // caller holds mtx, the files are removed by the caller without the lock
+    void evict_locked(size_t n_needed, std::vector<std::string> & files) {
+        if (n_bytes + n_needed <= n_bytes_max) {
+            return;
+        }
+
+        std::vector<std::pair<int64_t, uint64_t>> order;
+        for (const auto & [id, t] : t_used) {
+            order.emplace_back(t, id);
+        }
+        std::sort(order.begin(), order.end());
+
+        for (const auto & [t, id] : order) {
+            if (n_bytes + n_needed <= n_bytes_max) {
+                break;
+            }
+            if (is_live_locked(*index[id]) || loading.count(id)) {
+                continue;
+            }
+            DSK_INF("evicting entry %s (%zu tokens, %.3f MiB)\n", hex64(id).c_str(),
+                    index[id]->prompt.tokens.size(), index[id]->n_bytes / (1024.0 * 1024.0));
+            erase_locked(id, files);
+            st.n_removed_evicted++;
+        }
+    }
+
+    // a slot continues the entry: it keeps the entry's protected prefix
+    bool is_live_locked(const entry & e) const {
+        const auto & tokens = e.prompt.tokens.get_tokens();
+        const size_t n = e.prompt.n_tokens_protected();
+        for (const auto & conv : live) {
+            if (conv.size() >= n && std::equal(tokens.begin(), tokens.begin() + n, conv.begin())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void erase_locked(uint64_t id, std::vector<std::string> & files) {
+        auto it = index.find(id);
+        if (it == index.end()) {
+            return;
+        }
+        n_bytes -= it->second->n_bytes;
+        index.erase(it);
+        t_used.erase(id);
+        files.push_back(path_of(id));
+    }
+
+    void set_error_locked(const std::string & msg) {
+        st.last_error = msg;
+    }
+
+    static void unlink_files(const std::vector<std::string> & files) {
+        for (const auto & f : files) {
+            std::error_code ec;
+            std::filesystem::remove(f, ec);
+            if (ec) {
+                DSK_WRN("failed to remove '%s': %s\n", f.c_str(), ec.message().c_str());
+            }
+        }
+    }
+
+    // parse and validate the header and the meta section; meta receives the meta bytes
+    bool parse_header(const uint8_t * hdr, size_t file_size, file_header & h) const {
+        byte_reader r { hdr, DISK_HEADER_SIZE };
+        r.get(h.magic); r.get(h.version); r.get(h.key_hash); r.get(h.id);
+        r.get(h.n_tokens); r.get(h.n_protected); r.get(h.pos_min); r.get(h.n_ckpt);
+        r.get(h.size_main); r.get(h.size_drft); r.get(h.size_meta); r.get(h.size_total); r.get(h.meta_hash);
+
+        if (h.magic != DISK_MAGIC || h.version != DISK_VERSION || h.key_hash != key_hash) {
+            return false;
+        }
+        // bound the counts by the file size before any allocation, the fields may be corrupt
+        if (h.size_total != file_size || h.n_tokens == 0 || h.n_tokens > file_size || h.n_ckpt > file_size) {
+            return false;
+        }
+        if (h.size_meta != h.n_tokens*sizeof(llama_token) + h.n_ckpt*DISK_CKPT_SIZE) {
+            return false;
+        }
+        if (h.size_main > file_size || h.size_drft > file_size || DISK_HEADER_SIZE + h.size_meta + DISK_TRAILER_SIZE > file_size) {
+            return false;
+        }
+        return true;
+    }
+
+#ifndef _WIN32
+    static bool read_all(int fd, void * dst, size_t n, const std::atomic<bool> & abort, xxh64 * h) {
+        uint8_t * p = (uint8_t *) dst;
+        while (n > 0) {
+            if (abort.load()) {
+                return false;
+            }
+            const size_t k = std::min(n, DISK_IO_CHUNK);
+            const ssize_t r = ::read(fd, p, k);
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            if (r <= 0) {
+                return false;
+            }
+            if (h) {
+                h->update(p, r);
+            }
+            p += r;
+            n -= r;
+        }
+        return true;
+    }
+
+    static bool write_all(int fd, const void * src, size_t n, const std::atomic<bool> & abort, xxh64 * h) {
+        const uint8_t * p = (const uint8_t *) src;
+        if (h) {
+            h->update(p, n);
+        }
+        while (n > 0) {
+            if (abort.load()) {
+                errno = ECANCELED;
+                return false;
+            }
+            const size_t k = std::min(n, DISK_IO_CHUNK);
+            const ssize_t r = ::write(fd, p, k);
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            if (r <= 0) {
+                return false;
+            }
+            p += r;
+            n -= r;
+        }
+        return true;
+    }
+
+    // read the header and the meta section of a file, validate them and build the index entry
+    // returns nullptr if the file is not a valid entry of this key
+    entry_ptr read_entry(const std::string & path, int64_t & mtime_ns) const {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return nullptr;
+        }
+
+        struct stat sb;
+        entry_ptr res;
+
+        do {
+            if (fstat(fd, &sb) != 0) {
+                break;
+            }
+            mtime_ns = (int64_t) sb.st_mtim.tv_sec*1000000000 + sb.st_mtim.tv_nsec;
+
+            uint8_t hdr[DISK_HEADER_SIZE];
+            file_header h;
+            if (!read_all(fd, hdr, sizeof(hdr), abort, nullptr) || !parse_header(hdr, sb.st_size, h)) {
+                break;
+            }
+
+            std::vector<uint8_t> meta(h.size_meta);
+            if (!read_all(fd, meta.data(), meta.size(), abort, nullptr)) {
+                break;
+            }
+
+            xxh64 hm;
+            hm.update(hdr, DISK_HEADER_SIZE - sizeof(uint64_t));
+            hm.update(meta.data(), meta.size());
+            if (hm.digest() != h.meta_hash) {
+                break;
+            }
+
+            llama_tokens tokens(h.n_tokens);
+            memcpy(tokens.data(), meta.data(), h.n_tokens*sizeof(llama_token));
+            if (server_cache_disk_hash_tokens(tokens) != h.id) {
+                break;
+            }
+
+            auto e = std::make_shared<entry>();
+            e->id      = h.id;
+            e->pos_min = h.pos_min;
+            e->n_bytes = sb.st_size;
+
+            size_t n_payload = h.size_main + h.size_drft;
+            byte_reader r { meta.data() + h.n_tokens*sizeof(llama_token), h.n_ckpt*DISK_CKPT_SIZE };
+            bool ok = true;
+            for (uint64_t i = 0; i < h.n_ckpt && ok; ++i) {
+                ckpt_meta c;
+                ok = r.get(c.n_tokens) && r.get(c.pos_min) && r.get(c.pos_max) && r.get(c.size_tgt) && r.get(c.size_dft) && r.get(c.size_spec);
+                ok = ok && c.size_tgt <= (uint64_t) sb.st_size && c.size_dft <= (uint64_t) sb.st_size && c.size_spec <= (uint64_t) sb.st_size;
+                if (ok) {
+                    n_payload += c.size_tgt + c.size_dft + c.size_spec;
+                    auto ckpt = std::make_shared<common_prompt_checkpoint>();
+                    ckpt->id_task  = -1;
+                    ckpt->n_tokens = c.n_tokens;
+                    ckpt->pos_min  = c.pos_min;
+                    ckpt->pos_max  = c.pos_max;
+                    e->prompt.checkpoints.push_back(std::move(ckpt));
+                }
+            }
+            if (!ok || file_size_of(h.n_tokens, h.n_ckpt, n_payload) != (size_t) sb.st_size) {
+                break;
+            }
+
+            e->prompt.tokens      = server_tokens(tokens, false);
+            e->prompt.n_protected = h.n_protected;
+
+            res = std::move(e);
+        } while (false);
+
+        ::close(fd);
+
+        return res;
+    }
+
+    // read a whole entry, verifying the payload checksum
+    bool read_full(uint64_t id, loaded_entry & out, bool & corrupt) const {
+        corrupt = false;
+
+        const std::string path = path_of(id);
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return false;
+        }
+
+#if defined(POSIX_FADV_SEQUENTIAL)
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+
+        bool ok = false;
+        corrupt = true;
+
+        do {
+            struct stat sb;
+            if (fstat(fd, &sb) != 0) {
+                corrupt = false;
+                break;
+            }
+
+            uint8_t hdr[DISK_HEADER_SIZE];
+            file_header h;
+            if (!read_all(fd, hdr, sizeof(hdr), abort, nullptr) || !parse_header(hdr, sb.st_size, h) || h.id != id) {
+                break;
+            }
+
+            std::vector<uint8_t> meta(h.size_meta);
+            if (!read_all(fd, meta.data(), meta.size(), abort, nullptr)) {
+                break;
+            }
+
+            xxh64 hm;
+            hm.update(hdr, DISK_HEADER_SIZE - sizeof(uint64_t));
+            hm.update(meta.data(), meta.size());
+            if (hm.digest() != h.meta_hash) {
+                break;
+            }
+
+            out.tokens.resize(h.n_tokens);
+            memcpy(out.tokens.data(), meta.data(), h.n_tokens*sizeof(llama_token));
+            out.n_protected = h.n_protected;
+            out.pos_min     = h.pos_min;
+
+            std::vector<ckpt_meta> cms(h.n_ckpt);
+            size_t n_payload = h.size_main + h.size_drft;
+            {
+                byte_reader r { meta.data() + h.n_tokens*sizeof(llama_token), h.n_ckpt*DISK_CKPT_SIZE };
+                bool ok_meta = true;
+                for (auto & c : cms) {
+                    ok_meta = ok_meta && r.get(c.n_tokens) && r.get(c.pos_min) && r.get(c.pos_max) && r.get(c.size_tgt) && r.get(c.size_dft) && r.get(c.size_spec);
+                    ok_meta = ok_meta && c.size_tgt <= (uint64_t) sb.st_size && c.size_dft <= (uint64_t) sb.st_size && c.size_spec <= (uint64_t) sb.st_size;
+                    if (ok_meta) {
+                        n_payload += c.size_tgt + c.size_dft + c.size_spec;
+                    }
+                }
+                if (!ok_meta || file_size_of(h.n_tokens, h.n_ckpt, n_payload) != (size_t) sb.st_size) {
+                    break;
+                }
+            }
+
+            xxh64 hp;
+
+            out.data = std::make_shared<server_prompt_data>();
+            out.data->main.resize(h.size_main);
+            out.data->drft.resize(h.size_drft);
+            if (!read_all(fd, out.data->main.data(), h.size_main, abort, &hp) ||
+                !read_all(fd, out.data->drft.data(), h.size_drft, abort, &hp)) {
+                corrupt = !abort.load();
+                break;
+            }
+
+            bool ok_ckpt = true;
+            for (const auto & c : cms) {
+                auto ckpt = std::make_shared<common_prompt_checkpoint>();
+                ckpt->id_task  = -1; // not created by a task - may fail to load, see update_slots()
+                ckpt->n_tokens = c.n_tokens;
+                ckpt->pos_min  = c.pos_min;
+                ckpt->pos_max  = c.pos_max;
+                ckpt->data_tgt.resize(c.size_tgt);
+                ckpt->data_dft.resize(c.size_dft);
+                ckpt->data_spec.resize(c.size_spec);
+                if (!read_all(fd, ckpt->data_tgt.data(),  c.size_tgt,  abort, &hp) ||
+                    !read_all(fd, ckpt->data_dft.data(),  c.size_dft,  abort, &hp) ||
+                    !read_all(fd, ckpt->data_spec.data(), c.size_spec, abort, &hp)) {
+                    ok_ckpt = false;
+                    break;
+                }
+                out.ckpts.push_back(std::move(ckpt));
+            }
+            if (!ok_ckpt) {
+                corrupt = !abort.load();
+                break;
+            }
+
+            uint8_t trl[DISK_TRAILER_SIZE];
+            if (!read_all(fd, trl, sizeof(trl), abort, nullptr)) {
+                break;
+            }
+            uint64_t data_hash = 0;
+            uint32_t magic_end = 0;
+            memcpy(&data_hash, trl, sizeof(data_hash));
+            memcpy(&magic_end, trl + sizeof(data_hash), sizeof(magic_end));
+            if (magic_end != DISK_MAGIC_END || data_hash != hp.digest()) {
+                break;
+            }
+
+            ok = true;
+            corrupt = false;
+        } while (false);
+
+        ::close(fd);
+
+        return ok;
+    }
+
+    // write an entry: temporary file, fsync, rename, fsync of the directory
+    bool write_file(const write_job & job, std::string & err) const {
+        const std::string path = path_of(job.id);
+        const std::string tmp  = dir + "/." + hex64(job.id) + "." + std::to_string(getpid()) + ".tmp";
+
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            err = std::string("cannot create '") + tmp + "': " + strerror(errno);
+            return false;
+        }
+
+        size_t n_payload = job.data->main.size() + job.data->drft.size();
+
+        byte_writer meta;
+        meta.put_raw(job.tokens.data(), job.tokens.size()*sizeof(llama_token));
+        for (const auto & c : job.ckpts) {
+            meta.put<int64_t> (c->n_tokens);
+            meta.put<int32_t> (c->pos_min);
+            meta.put<int32_t> (c->pos_max);
+            meta.put<uint64_t>(c->data_tgt.size());
+            meta.put<uint64_t>(c->data_dft.size());
+            meta.put<uint64_t>(c->data_spec.size());
+            n_payload += c->data_tgt.size() + c->data_dft.size() + c->data_spec.size();
+        }
+
+        byte_writer hdr;
+        hdr.put<uint32_t>(DISK_MAGIC);
+        hdr.put<uint32_t>(DISK_VERSION);
+        hdr.put<uint64_t>(key_hash);
+        hdr.put<uint64_t>(job.id);
+        hdr.put<uint64_t>(job.tokens.size());
+        hdr.put<int64_t> (job.n_protected);
+        hdr.put<int64_t> (job.pos_min);
+        hdr.put<uint64_t>(job.ckpts.size());
+        hdr.put<uint64_t>(job.data->main.size());
+        hdr.put<uint64_t>(job.data->drft.size());
+        hdr.put<uint64_t>(meta.buf.size());
+        hdr.put<uint64_t>(file_size_of(job.tokens.size(), job.ckpts.size(), n_payload));
+        {
+            xxh64 hm;
+            hm.update(hdr.buf.data(), hdr.buf.size());
+            hm.update(meta.buf.data(), meta.buf.size());
+            hdr.put<uint64_t>(hm.digest());
+        }
+        GGML_ASSERT(hdr.buf.size() == DISK_HEADER_SIZE);
+
+        xxh64 hp;
+
+        bool ok = write_all(fd, hdr.buf.data(),  hdr.buf.size(),  abort, nullptr) &&
+                  write_all(fd, meta.buf.data(), meta.buf.size(), abort, nullptr) &&
+                  write_all(fd, job.data->main.data(), job.data->main.size(), abort, &hp) &&
+                  write_all(fd, job.data->drft.data(), job.data->drft.size(), abort, &hp);
+
+        for (const auto & c : job.ckpts) {
+            ok = ok && write_all(fd, c->data_tgt.data(),  c->data_tgt.size(),  abort, &hp)
+                    && write_all(fd, c->data_dft.data(),  c->data_dft.size(),  abort, &hp)
+                    && write_all(fd, c->data_spec.data(), c->data_spec.size(), abort, &hp);
+        }
+
+        if (ok) {
+            byte_writer trl;
+            trl.put<uint64_t>(hp.digest());
+            trl.put<uint32_t>(DISK_MAGIC_END);
+            trl.put<uint32_t>(0);
+            ok = write_all(fd, trl.buf.data(), trl.buf.size(), abort, nullptr);
+        }
+
+        ok = ok && fsync(fd) == 0;
+
+        if (!ok) {
+            err = std::string("cannot write '") + tmp + "': " + strerror(errno);
+        }
+
+        if (::close(fd) != 0 && ok) {
+            ok  = false;
+            err = std::string("cannot close '") + tmp + "': " + strerror(errno);
+        }
+
+        if (ok && rename(tmp.c_str(), path.c_str()) != 0) {
+            ok  = false;
+            err = std::string("cannot rename '") + tmp + "': " + strerror(errno);
+        }
+
+        if (!ok) {
+            ::unlink(tmp.c_str());
+            return false;
+        }
+
+        const int fd_dir = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd_dir >= 0) {
+            fsync(fd_dir);
+            ::close(fd_dir);
+        }
+
+        return true;
+    }
+#endif
+
+    void process_write(write_job & job) {
+#ifndef _WIN32
+        std::vector<std::string> files;
+
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+
+            if (index.count(job.id)) {
+                t_used[job.id] = time_now_ns();
+                st.n_write_skipped++;
+                return;
+            }
+
+            if (job.n_bytes > n_bytes_max) {
+                DSK_WRN("entry %s (%.3f MiB) is larger than the disk cache limit (%.3f MiB), skipping\n",
+                        hex64(job.id).c_str(), job.n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0));
+                st.n_write_skipped++;
+                return;
+            }
+
+            // make room first, so that the directory stays within its bound
+            evict_locked(job.n_bytes, files);
+        }
+
+        unlink_files(files);
+        files.clear();
+
+        const int64_t t_start = ggml_time_us();
+
+        std::string err;
+        const bool ok = write_file(job, err);
+
+        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+
+        std::unique_lock<std::mutex> lock(mtx);
+
+        if (!ok) {
+            if (!abort.load()) {
+                DSK_ERR("failed to write entry %s: %s\n", hex64(job.id).c_str(), err.c_str());
+                st.n_write_errors++;
+                set_error_locked(err);
+            }
+            return;
+        }
+
+        auto e = std::make_shared<entry>();
+        e->id      = job.id;
+        e->pos_min = job.pos_min;
+        e->n_bytes = job.n_bytes;
+        e->prompt.tokens      = server_tokens(job.tokens, false);
+        e->prompt.n_protected = job.n_protected;
+        for (const auto & c : job.ckpts) {
+            auto ckpt = std::make_shared<common_prompt_checkpoint>();
+            ckpt->id_task  = -1;
+            ckpt->n_tokens = c->n_tokens;
+            ckpt->pos_min  = c->pos_min;
+            ckpt->pos_max  = c->pos_max;
+            e->prompt.checkpoints.push_back(std::move(ckpt));
+        }
+
+        // the entries that the new one continues are contained in it
+        for (auto it = index.begin(); it != index.end();) {
+            const auto & cur = it->second;
+            if (cur->prompt.is_continued_by(e->prompt.tokens)) {
+                DSK_INF("removing entry %s (%zu tokens), superseded by %s\n", hex64(cur->id).c_str(), cur->prompt.tokens.size(), hex64(job.id).c_str());
+                n_bytes -= cur->n_bytes;
+                t_used.erase(cur->id);
+                files.push_back(path_of(cur->id));
+                it = index.erase(it);
+                st.n_removed_superseded++;
+            } else {
+                ++it;
+            }
+        }
+
+        index[job.id]  = e;
+        t_used[job.id] = time_now_ns();
+        n_bytes += job.n_bytes;
+
+        st.n_writes++;
+        st.n_bytes_written += job.n_bytes;
+        st.t_write_ms      += t_ms;
+
+        DSK_INF("wrote entry %s: %zu tokens, %zu checkpoints, %.3f MiB in %.2f ms\n",
+                hex64(job.id).c_str(), job.tokens.size(), job.ckpts.size(), job.n_bytes / (1024.0 * 1024.0), t_ms);
+
+        lock.unlock();
+
+        unlink_files(files);
+#else
+        GGML_UNUSED(job);
+#endif
+    }
+
+    void writer_loop() {
+        while (true) {
+            write_job job;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv_jobs.wait(lock, [&] { return stopping || !jobs.empty(); });
+                if (jobs.empty() || abort.load()) {
+                    break;
+                }
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+
+            switch (job.type) {
+                case write_job::WRITE:
+                    process_write(job);
+                    break;
+                case write_job::TOUCH:
+                    {
+#ifndef _WIN32
+                        // the mtime keeps the LRU order across restarts
+                        utimensat(AT_FDCWD, path_of(job.id).c_str(), nullptr, 0);
+#endif
+                    } break;
+                case write_job::REMOVE:
+                    unlink_files({ path_of(job.id) });
+                    break;
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                if (job.type == write_job::WRITE) {
+                    jobs_pending.erase(job.id);
+                    jobs_bytes -= job.n_bytes;
+                }
+                seq_done = job.seq;
+            }
+            cv_done.notify_all();
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            writer_exited = true;
+        }
+        cv_done.notify_all();
+    }
+
+    void reader_loop() {
+        while (true) {
+            uint64_t id = 0;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv_jobs.wait(lock, [&] { return stopping || !load_queue.empty(); });
+                if (stopping) {
+                    break;
+                }
+                id = load_queue.front();
+                load_queue.pop_front();
+            }
+
+            auto res = std::make_shared<loaded_entry>();
+
+            const int64_t t_start = ggml_time_us();
+
+            bool corrupt = false;
+#ifndef _WIN32
+            res->ok = read_full(id, *res, corrupt);
+#endif
+
+            const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+
+            std::vector<std::string> files;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+
+                size_t n_bytes_entry = 0;
+                if (auto it = index.find(id); it != index.end()) {
+                    n_bytes_entry = it->second->n_bytes;
+                }
+
+                if (res->ok) {
+                    st.n_reads++;
+                    st.n_bytes_read += n_bytes_entry;
+                    st.t_read_ms    += t_ms;
+                    t_used[id] = time_now_ns();
+                    DSK_INF("read entry %s: %zu tokens, %.3f MiB in %.2f ms\n", hex64(id).c_str(), res->tokens.size(), n_bytes_entry / (1024.0 * 1024.0), t_ms);
+                } else {
+                    st.n_read_errors++;
+                    if (corrupt) {
+                        DSK_ERR("entry %s is corrupt, removing it\n", hex64(id).c_str());
+                        set_error_locked("corrupt entry " + hex64(id));
+                        st.n_removed_corrupt++;
+                        erase_locked(id, files);
+                    } else if (!abort.load()) {
+                        DSK_ERR("failed to read entry %s\n", hex64(id).c_str());
+                        set_error_locked("cannot read entry " + hex64(id));
+                    }
+                    res = std::make_shared<loaded_entry>();
+                }
+
+                loaded[id] = res;
+                loading.erase(id);
+            }
+
+            unlink_files(files);
+
+#ifndef _WIN32
+            if (res->ok) {
+                utimensat(AT_FDCWD, path_of(id).c_str(), nullptr, 0);
+            }
+#endif
+
+            {
+                std::unique_lock<std::mutex> lock(mtx_callback);
+                bool cancelled;
+                {
+                    std::unique_lock<std::mutex> lock_st(mtx);
+                    cancelled = stopping;
+                }
+                if (!cancelled && on_loaded) {
+                    on_loaded(id);
+                }
+            }
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            reader_exited = true;
+        }
+        cv_done.notify_all();
+    }
+
+    std::thread writer;
+    std::thread reader;
+};
+
+std::string server_cache_disk_file_identity(const std::string & path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return "missing";
+    }
+
+    constexpr size_t n_part = 1024*1024;
+
+    std::string res = "size=" + std::to_string(size);
+
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return res + ",unreadable";
+    }
+
+    std::vector<uint8_t> buf(n_part);
+
+    const size_t n_head = fread(buf.data(), 1, std::min<size_t>(n_part, size), f);
+    res += ",head=" + hex64(server_cache_disk_hash(buf.data(), n_head));
+
+    if (size > n_part && fseek(f, -(long) n_part, SEEK_END) == 0) {
+        const size_t n_tail = fread(buf.data(), 1, n_part, f);
+        res += ",tail=" + hex64(server_cache_disk_hash(buf.data(), n_tail));
+    }
+
+    fclose(f);
+
+    return res;
+}
+
+//
+// server_cache_disk
+//
+
+std::unique_ptr<server_cache_disk> server_cache_disk::open(
+        const std::string & dir_root,
+        const std::string & key_name,
+        const std::string & key,
+        size_t n_bytes_max,
+        std::function<void(uint64_t)> on_loaded) {
+#ifdef _WIN32
+    GGML_UNUSED(dir_root);
+    GGML_UNUSED(key_name);
+    GGML_UNUSED(key);
+    GGML_UNUSED(n_bytes_max);
+    GGML_UNUSED(on_loaded);
+    DSK_ERR("%s", "the disk prompt cache is not supported on Windows\n");
+    return nullptr;
+#else
+    namespace fs = std::filesystem;
+
+    const uint64_t key_hash = server_cache_disk_hash(key.data(), key.size());
+    const std::string dir = (fs::path(dir_root) / (key_name + "-" + hex64(key_hash))).string();
+
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        DSK_ERR("cannot create the cache directory '%s': %s\n", dir.c_str(), ec.message().c_str());
+        return nullptr;
+    }
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+
+    if (access(dir.c_str(), R_OK | W_OK | X_OK) != 0) {
+        DSK_ERR("the cache directory '%s' is not writable: %s\n", dir.c_str(), strerror(errno));
+        return nullptr;
+    }
+
+    // a description of the key, for the operator
+    {
+        const std::string path = dir + "/IDENTITY";
+        const std::string tmp  = path + "." + std::to_string(getpid()) + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "wb");
+        if (f == nullptr || fwrite(key.data(), 1, key.size(), f) != key.size() || fclose(f) != 0 || rename(tmp.c_str(), path.c_str()) != 0) {
+            DSK_ERR("cannot write '%s': %s\n", path.c_str(), strerror(errno));
+            unlink(tmp.c_str());
+            return nullptr;
+        }
+    }
+
+    std::unique_ptr<server_cache_disk> res(new server_cache_disk());
+    res->path_dir = dir;
+    res->st = std::make_shared<state>();
+
+    auto & s = *res->st;
+    s.dir         = dir;
+    s.key_hash    = key_hash;
+    s.n_bytes_max = n_bytes_max;
+    s.on_loaded   = std::move(on_loaded);
+    s.st.n_bytes_max = n_bytes_max;
+
+    // index the entries: headers and tokens only
+    const int64_t t_start = ggml_time_us();
+
+    std::vector<std::string> files;
+    for (const auto & de : fs::directory_iterator(dir, ec)) {
+        const std::string name = de.path().filename().string();
+
+        // a temporary file of a process that is gone is the rest of an interrupted write
+        if (name.size() > 4 && name[0] == '.' && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+            const size_t p1 = name.find('.', 1);
+            const size_t p2 = name.rfind('.');
+            const long pid = p1 != std::string::npos && p2 > p1 ? atol(name.substr(p1 + 1, p2 - p1 - 1).c_str()) : 0;
+            if (pid <= 0 || (kill((pid_t) pid, 0) != 0 && errno == ESRCH)) {
+                DSK_WRN("removing interrupted write '%s'\n", name.c_str());
+                files.push_back(de.path().string());
+            }
+            continue;
+        }
+
+        if (name.size() != 16 + 4 || name.compare(16, 4, ".bin") != 0) {
+            continue;
+        }
+
+        int64_t mtime_ns = 0;
+        auto e = s.read_entry(de.path().string(), mtime_ns);
+        if (!e || hex64(e->id) + ".bin" != name) {
+            DSK_WRN("removing invalid or truncated entry '%s'\n", name.c_str());
+            s.st.n_removed_corrupt++;
+            files.push_back(de.path().string());
+            continue;
+        }
+
+        s.n_bytes += e->n_bytes;
+        s.t_used[e->id] = mtime_ns;
+        s.index[e->id]  = std::move(e);
+    }
+
+    // the bound may be lower than in the previous run
+    s.evict_locked(0, files);
+
+    state::unlink_files(files);
+
+    DSK_INF("disk prompt cache in '%s': %zu entries, %.3f MiB (limit %.3f MiB), indexed in %.2f ms\n",
+            dir.c_str(), s.index.size(), s.n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+
+    auto sp = res->st;
+    s.writer = std::thread([sp]() { sp->writer_loop(); });
+    s.reader = std::thread([sp]() { sp->reader_loop(); });
+
+    return res;
+#endif
+}
+
+server_cache_disk::~server_cache_disk() {
+    stop(0);
+}
+
+uint64_t server_cache_disk::write(const server_prompt_cache_state & state) {
+    // media chunks are not written, their tokens are placeholders
+    llama_tokens tokens;
+    const bool text_only = server_cache_disk_text_tokens(state.prompt.tokens, tokens);
+
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    if (st->stopping || !text_only || tokens.empty() || !state.data) {
+        return st->seq_queued;
+    }
+
+    const uint64_t id = server_cache_disk_hash_tokens(tokens);
+
+    if (st->jobs_pending.count(id)) {
+        return st->seq_queued;
+    }
+
+    write_job job;
+    job.type        = write_job::WRITE;
+    job.seq         = ++st->seq_queued;
+    job.id          = id;
+    job.tokens      = std::move(tokens);
+    job.n_protected = state.prompt.n_protected;
+    job.pos_min     = state.pos_min;
+    job.data        = state.data;
+
+    size_t n_payload = state.data->main.size() + state.data->drft.size();
+    for (const auto & c : state.prompt.checkpoints) {
+        job.ckpts.push_back(c);
+        n_payload += c->data_tgt.size() + c->data_dft.size() + c->data_spec.size();
+    }
+    job.n_bytes = file_size_of(tokens.size(), job.ckpts.size(), n_payload);
+
+    st->jobs_pending.insert(id);
+    st->jobs_bytes += job.n_bytes;
+    st->jobs.push_back(std::move(job));
+
+    const uint64_t seq = st->seq_queued;
+
+    lock.unlock();
+    st->cv_jobs.notify_all();
+
+    return seq;
+}
+
+std::vector<server_cache_disk::entry_ptr> server_cache_disk::entries() const {
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    std::vector<entry_ptr> res;
+    res.reserve(st->index.size());
+    for (const auto & [id, e] : st->index) {
+        res.push_back(e);
+    }
+    return res;
+}
+
+bool server_cache_disk::load_async(uint64_t id) {
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    if (st->loading.count(id)) {
+        return true;
+    }
+
+    if (st->stopping || !st->index.count(id)) {
+        return false;
+    }
+
+    st->loading.insert(id);
+    st->load_queue.push_back(id);
+    st->loaded.erase(id);
+
+    lock.unlock();
+    st->cv_jobs.notify_all();
+
+    return true;
+}
+
+server_cache_disk::load_result server_cache_disk::take_loaded(uint64_t id, server_prompt_cache_state & out, bool has_mtmd) {
+    std::shared_ptr<loaded_entry> res;
+    {
+        std::unique_lock<std::mutex> lock(st->mtx);
+        auto it = st->loaded.find(id);
+        if (it == st->loaded.end()) {
+            return st->loading.count(id) ? LOAD_PENDING : LOAD_FAILED;
+        }
+        res = std::move(it->second);
+        st->loaded.erase(it);
+    }
+
+    if (!res || !res->ok) {
+        return LOAD_FAILED;
+    }
+
+    out.prompt.tokens      = server_tokens(res->tokens, has_mtmd);
+    out.prompt.n_protected = res->n_protected;
+    out.prompt.checkpoints.clear();
+    for (auto & c : res->ckpts) {
+        out.prompt.checkpoints.push_back(std::move(c));
+    }
+    out.pos_min = res->pos_min;
+    out.data    = std::move(res->data);
+    out.id      = id;
+
+    return LOAD_OK;
+}
+
+void server_cache_disk::touch(uint64_t id) {
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    if (st->stopping || !st->index.count(id)) {
+        return;
+    }
+
+    st->t_used[id] = time_now_ns();
+
+    write_job job;
+    job.type = write_job::TOUCH;
+    job.seq  = ++st->seq_queued;
+    job.id   = id;
+    st->jobs.push_back(std::move(job));
+
+    lock.unlock();
+    st->cv_jobs.notify_all();
+}
+
+void server_cache_disk::remove(uint64_t id) {
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    if (st->stopping) {
+        return;
+    }
+
+    std::vector<std::string> files;
+    st->erase_locked(id, files);
+    if (files.empty()) {
+        return;
+    }
+
+    DSK_WRN("removing entry %s\n", hex64(id).c_str());
+
+    write_job job;
+    job.type = write_job::REMOVE;
+    job.seq  = ++st->seq_queued;
+    job.id   = id;
+    st->jobs.push_back(std::move(job));
+
+    lock.unlock();
+    st->cv_jobs.notify_all();
+}
+
+void server_cache_disk::set_live(std::vector<llama_tokens> conversations) {
+    std::unique_lock<std::mutex> lock(st->mtx);
+    st->live = std::move(conversations);
+}
+
+uint64_t server_cache_disk::ticket() const {
+    std::unique_lock<std::mutex> lock(st->mtx);
+    return st->seq_queued;
+}
+
+bool server_cache_disk::wait(uint64_t ticket, int64_t timeout_ms) const {
+    std::unique_lock<std::mutex> lock(st->mtx);
+    return st->cv_done.wait_for(lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)), [&] {
+        return st->seq_done >= ticket || st->writer_exited;
+    }) && st->seq_done >= ticket;
+}
+
+void server_cache_disk::stop(int64_t timeout_ms) {
+    if (!st) {
+        return;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(st->mtx);
+        if (!st->writer.joinable() && !st->reader.joinable()) {
+            return;
+        }
+        st->stopping = true;
+    }
+    st->cv_jobs.notify_all();
+
+    // a load callback in progress finishes before the server goes away
+    {
+        std::unique_lock<std::mutex> lock(st->mtx_callback);
+    }
+
+    const auto exited = [&] { return st->writer_exited && st->reader_exited; };
+
+    bool ok;
+    {
+        std::unique_lock<std::mutex> lock(st->mtx);
+        ok = st->cv_done.wait_for(lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)), exited);
+        if (!ok && !st->jobs_pending.empty()) {
+            DSK_WRN("abandoning %zu queued writes (%.3f MiB)\n", st->jobs_pending.size(), st->jobs_bytes / (1024.0 * 1024.0));
+        }
+    }
+
+    if (!ok) {
+        // abandon the remaining writes, a write in progress stops at the next chunk and removes its temporary file
+        st->abort.store(true);
+        st->cv_jobs.notify_all();
+
+        std::unique_lock<std::mutex> lock(st->mtx);
+        ok = st->cv_done.wait_for(lock, std::chrono::seconds(5), exited);
+    }
+
+    if (ok) {
+        st->writer.join();
+        st->reader.join();
+    } else {
+        // stuck in the kernel: let the process exit without it, the threads keep the state alive
+        DSK_ERR("%s", "the disk cache threads did not stop, detaching them\n");
+        st->writer.detach();
+        st->reader.detach();
+    }
+}
+
+server_cache_disk_stats server_cache_disk::stats() const {
+    std::unique_lock<std::mutex> lock(st->mtx);
+
+    server_cache_disk_stats res = st->st;
+    res.n_entries       = st->index.size();
+    res.n_bytes         = st->n_bytes;
+    res.n_bytes_max     = st->n_bytes_max;
+    res.n_backlog       = st->jobs_pending.size();
+    res.n_backlog_bytes = st->jobs_bytes;
+    res.n_loading       = st->loading.size();
+    return res;
+}

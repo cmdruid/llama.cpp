@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <memory>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -32,6 +33,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_CACHE_LOADED, // a disk cache entry was read, see server-cache-disk.h
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -748,15 +750,23 @@ struct server_prompt_data {
     }
 };
 
+struct server_cache_disk;
+struct server_cache_disk_entry;
+
 struct server_prompt_cache_state {
     server_prompt prompt;
-    server_prompt_data data;
+
+    // not modified once the entry is complete, so the disk writer can share it
+    std::shared_ptr<server_prompt_data> data;
 
     // the lowest position held by the saved state of the sequence, see llama_memory_seq_pos_min()
     llama_pos pos_min = 0;
 
+    // hash of the tokens, the name of the entry in the disk cache
+    uint64_t id = 0;
+
     size_t size() const {
-        size_t res = data.size();
+        size_t res = data ? data->size() : 0;
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt->size();
@@ -796,11 +806,51 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // n_usable() if the entry is a candidate for the request, 0 otherwise:
+    // restoring a large state to reuse a small part of it costs more than it saves, unless the request continues it
+    int32_t n_candidate(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const;
+
     // restore the entry that the request reuses most, if it reuses more than `prompt` (the slot) already holds
-    // returns false if the state could not be restored
+    // returns false if the state could not be restored, id_failed is then the entry that failed
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    //
+    // disk tier, see server-cache-disk.h
+    //
+
+    server_cache_disk * disk = nullptr;
+
+    uint64_t id_failed = 0;
+
+    struct stats_t {
+        uint64_t n_saves      = 0; // entries added by saving a slot
+        uint64_t n_hits_ram   = 0; // entries restored into a slot
+        uint64_t n_hits_disk  = 0; // entries read from disk into RAM for a request
+        uint64_t n_misses     = 0; // lookups where neither the slot nor an entry had anything for the request
+        uint64_t n_evictions  = 0; // entries dropped from RAM to stay within the limits (they remain on disk)
+        uint64_t n_failed     = 0; // restores that failed
+        double   t_save_ms    = 0.0;
+        double   t_load_ms    = 0.0;
+    } stats;
+
+    // the entry was completed by saving a slot: write it to disk
+    void on_saved(const server_prompt_cache_state & state);
+
+    // the disk entry the request reuses most, if it reuses more than n_floor tokens and is not in RAM already
+    std::shared_ptr<const server_cache_disk_entry> find_disk(const server_tokens & tokens_new, int32_t n_floor) const;
+
+    // the most tokens a RAM entry offers to the request
+    int32_t n_best(const server_tokens & tokens_new) const;
+
+    // add an entry read from disk, making room for it; false if it does not fit
+    bool insert(server_prompt_cache_state && state);
+
+    // drop an entry, e.g. one that failed to restore
+    void erase(uint64_t id);
+
+    bool contains(uint64_t id) const;
 };
 
 // used exclusively by router mode

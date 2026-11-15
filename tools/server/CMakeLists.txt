@@ -8,6 +8,8 @@ add_library(${TARGET} STATIC
     server-chat.cpp
     server-chat.h
     server-task.cpp
+    server-cache-disk.cpp
+    server-cache-disk.h
     server-task.h
     server-queue.cpp
     server-queue.h

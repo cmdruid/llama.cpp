@@ -112,6 +112,19 @@ void server_queue::pop_deferred_task(int id_slot) {
     condition_tasks.notify_one();
 }
 
+void server_queue::pop_deferred_task_by_id(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
+        if (it->id == id_task) {
+            QUE_DBG("pop deferred task, id_task = %d\n", id_task);
+            queue_tasks.emplace_front(std::move(*it));
+            queue_tasks_deferred.erase(it);
+            condition_tasks.notify_one();
+            break;
+        }
+    }
+}
+
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (sleeping) {
