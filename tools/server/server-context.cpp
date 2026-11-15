@@ -2020,7 +2020,6 @@ private:
 
             prompt_cache->update();
 
-            cache_update_metrics();
 
             SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
         }
@@ -2301,20 +2300,6 @@ private:
         cache_disk->set_live(std::move(live));
     }
 
-    // copy the prompt cache counters into the metrics, so that /metrics can read them without the server loop
-    void cache_update_metrics() {
-        auto & m = metrics.cache;
-        if (prompt_cache) {
-            m.n_saves       = prompt_cache->stats.n_saves;
-            m.n_hits_ram    = prompt_cache->stats.n_hits_ram;
-            m.n_hits_disk   = prompt_cache->stats.n_hits_disk;
-            m.n_misses      = prompt_cache->stats.n_misses;
-            m.n_evictions   = prompt_cache->stats.n_evictions;
-            m.n_entries_ram = prompt_cache->states.size();
-            m.n_bytes_ram   = prompt_cache->size();
-        }
-    }
-
     struct cache_persist_result {
         int      n_saved  = 0; // slots saved to the cache
         int      n_cached = 0; // slots whose conversation was already in the cache
@@ -2363,7 +2348,6 @@ private:
 
         prompt_cache->update();
 
-        cache_update_metrics();
         cache_disk_update_live();
 
         // everything not on disk yet is written now, the slots just saved first
@@ -2416,7 +2400,6 @@ private:
 
         if (n_saved > 0) {
             prompt_cache->update();
-            cache_update_metrics();
             cache_disk_update_live();
         }
     }
@@ -3677,12 +3660,10 @@ private:
                     }
 
                     cache_disk_update_live();
-                    cache_update_metrics();
                 } break;
             case SERVER_TASK_TYPE_CACHE_LOADED:
                 {
                     cache_disk_loaded();
-                    cache_update_metrics();
                 } break;
             case SERVER_TASK_TYPE_CACHE_STATUS:
                 {
@@ -3790,19 +3771,6 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
-
-                    // thread-safe, this task may run while the loop decodes
-                    if (cache_disk) {
-                        const auto st = cache_disk->stats();
-                        auto & m = res->metrics.cache;
-                        m.disk             = true;
-                        m.n_entries_disk   = st.n_entries;
-                        m.n_bytes_disk     = st.n_bytes;
-                        m.n_backlog_bytes  = st.n_backlog_bytes;
-                        m.n_disk_writes    = st.n_writes;
-                        m.n_disk_errors    = st.n_write_errors + st.n_read_errors;
-                        m.n_disk_evictions = st.n_removed_evicted;
-                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();

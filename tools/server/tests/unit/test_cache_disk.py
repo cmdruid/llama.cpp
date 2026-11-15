@@ -341,28 +341,6 @@ def test_sleep_keeps_disk_tier():
     assert len(entry_files()) == 1 # OTHER was in the slot: discarded by the sleep, not written
 
 
-def test_metrics():
-    global server
-    server.server_metrics = True
-    server.start()
-
-    complete(LONG_PROMPT)
-    complete(OTHER_PROMPT)
-    wait_disk("writes", 1)
-
-    res = server.make_request("GET", "/metrics")
-    assert res.status_code == 200
-    metrics = {}
-    for line in res.body.splitlines():
-        if line.startswith("llamacpp:prompt_cache"):
-            k, v = line.split(" ")
-            metrics[k] = float(v)
-    assert metrics["llamacpp:prompt_cache_saves_total"] >= 1
-    assert metrics["llamacpp:prompt_cache_disk_entries"] == 1
-    assert metrics["llamacpp:prompt_cache_disk_bytes"] > 0
-    assert metrics["llamacpp:prompt_cache_disk_writes_total"] == 1
-
-
 def test_disabled_without_cache_ram():
     global server
     server.cache_ram = 0
@@ -995,7 +973,6 @@ def test_write_error(monkeypatch):
     global server
     import errno
     monkeypatch.setenv("LLAMA_SERVER_TEST_CACHE_DISK_WRITE_ERRNO", str(errno.ENOSPC))
-    server.server_metrics = True
     server.start()
     log = LogReader(server.log_path)
 
@@ -1008,9 +985,6 @@ def test_write_error(monkeypatch):
     assert "No space left on device" in st["last_error"]
     assert glob.glob(os.path.join(server.cache_dir, "*", "*.bin")) == []
     assert glob.glob(os.path.join(server.cache_dir, "*", ".*.tmp")) == []
-
-    res = server.make_request("GET", "/metrics")
-    assert "llamacpp:prompt_cache_disk_errors_total 1" in res.body
 
     # still in RAM
     log.drain()

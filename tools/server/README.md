@@ -1256,14 +1256,6 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
-| `llamacpp:prompt_cache_saves_total` | Counter | Prompt cache entries saved from a slot. |
-| `llamacpp:prompt_cache_hits_ram_total` | Counter | Prompt cache entries restored into a slot. |
-| `llamacpp:prompt_cache_hits_disk_total` | Counter | Disk cache entries read into RAM for a request. |
-| `llamacpp:prompt_cache_misses_total` | Counter | Requests for which neither the slot nor the cache had anything to reuse. |
-| `llamacpp:prompt_cache_evictions_total` | Counter | Entries dropped from RAM to fit `--cache-ram` (they remain on disk with `--cache-dir`). |
-| `llamacpp:prompt_cache_ram_entries`, `llamacpp:prompt_cache_ram_bytes` | Gauge | Entries and bytes in the RAM tier. |
-| `llamacpp:prompt_cache_disk_entries`, `llamacpp:prompt_cache_disk_bytes`, `llamacpp:prompt_cache_disk_backlog_bytes` | Gauge | Entries of this server's key in the disk tier, bytes of all keys under `--cache-dir` (the bounded size), bytes waiting to be written (only with `--cache-dir`). |
-| `llamacpp:prompt_cache_disk_writes_total`, `llamacpp:prompt_cache_disk_errors_total`, `llamacpp:prompt_cache_disk_evictions_total` | Counter | Disk tier writes, failed writes and reads, entries removed to fit `--cache-dir-max` (only with `--cache-dir`). |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
@@ -2647,7 +2639,7 @@ earlier prompt cache:
 - with a unified KV cache, a restore that fails for lack of cells is retried after saving and clearing the other idle
   slots, and an idle slot is saved before it is purged; an entry that still fails to restore without other slots
   holding cells is dropped from RAM;
-- `GET /cache` and the `prompt_cache_*` metrics are new.
+- `GET /cache` is new.
 
 **Disk tier.** Entries are stored in `DIR/<arch>-<hash>/`, where the hash covers everything that shapes a saved state:
 the build (number and commit: an upgraded server starts cold), the model and draft model files (size and hashes of their
@@ -2688,7 +2680,7 @@ never later than the present: an mtime in the future (the clock was stepped back
 so such entries are evicted like the others instead of filling the bound. When a conversation grows, the entry it replaces makes room first. The entries of live conversations and those being read are
 not evicted; if they leave no room for a new entry, its write is skipped (`writes_no_room`) and it stays in RAM, where
 it is lost once the RAM cache drops it (it is not written again). During
-a write, the entries it supersedes stay on disk until it completes. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
+a write, the entries it supersedes stay on disk until it completes. Prompts with media are not written to disk. `GET /cache` shows what the tiers hold.
 
 **Write-behind.** `--cache-dir-delay` is the maximum age of a conversation's progress that is not on disk. An entry is
 not written when it is saved to RAM, but when one of these happens first:

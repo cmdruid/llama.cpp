@@ -549,25 +549,6 @@ struct server_metrics {
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
 
-    // prompt cache, see server_prompt_cache::stats_t and server_cache_disk_stats
-    struct cache_t {
-        uint64_t n_saves     = 0;
-        uint64_t n_hits_ram  = 0;
-        uint64_t n_hits_disk = 0;
-        uint64_t n_misses    = 0;
-        uint64_t n_evictions = 0;
-        uint64_t n_entries_ram = 0;
-        uint64_t n_bytes_ram   = 0;
-
-        bool     disk = false;
-        uint64_t n_entries_disk  = 0;
-        uint64_t n_bytes_disk    = 0;
-        uint64_t n_backlog_bytes = 0;
-        uint64_t n_disk_writes   = 0;
-        uint64_t n_disk_errors   = 0; // write and read errors
-        uint64_t n_disk_evictions = 0;
-    } cache;
-
     void init() {
         t_start = ggml_time_us();
     }
