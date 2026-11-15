@@ -2696,8 +2696,10 @@ still gets its state.
 
 **Bound.** `--cache-dir-max` bounds `DIR` as a whole, across keys: at start-up the server also counts the entries of the
 other keys (from their sizes and mtimes) and evicts them like its own, least recently used first, so a stale key (after
-a model update or a context change) gives its space back; a key directory left without entries is removed. When a
-conversation grows, the entry it replaces makes room first. The entries of live conversations and those being read are
+a model update or a context change) gives its space back; a key directory left without entries is removed. The last use
+of an entry is the time it was saved to RAM or restored (its file's mtime), not the time of its write, and a new entry
+evicts only entries used less recently than itself, so the order in which the writer works does not change which
+entries stay. When a conversation grows, the entry it replaces makes room first. The entries of live conversations and those being read are
 not evicted; if they leave no room for a new entry, its write is skipped (`writes_no_room`) and it stays in RAM. During
 a write, the entries it supersedes stay on disk until it completes. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
 

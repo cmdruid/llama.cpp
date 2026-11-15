@@ -260,6 +260,10 @@ struct write_job {
     std::shared_ptr<const server_prompt_data> data;
 
     size_t n_bytes = 0; // the size of the file
+
+    // the last use of the entry (ns since epoch): its save to the RAM cache, not the time of the write, so that the
+    // LRU order does not depend on the order of the writes; the file gets it as its mtime
+    int64_t t_used = 0;
 };
 
 // a write that waits for its delay, see server_cache_disk::stage()
@@ -563,10 +567,11 @@ struct server_cache_disk::state {
         others.erase(it);
     }
 
-    // the oldest entries of any key that are neither live, loading, being removed nor in `keep`, until n_needed more
-    // bytes fit once n_freed bytes are released; false if they cannot be made to fit
+    // the oldest entries of any key that are neither live, loading, being removed nor in `keep`, and were used before
+    // t_before, until n_needed more bytes fit once n_freed bytes are released; false if they cannot be made to fit
+    // (an entry to write evicts only entries used less recently than itself: otherwise it is the one to drop)
     // nothing is removed, see evict_locked()
-    bool plan_evict_locked(size_t n_needed, size_t n_freed, const std::vector<uint64_t> & keep, std::vector<victim> & out) const {
+    bool plan_evict_locked(size_t n_needed, size_t n_freed, const std::vector<uint64_t> & keep, int64_t t_before, std::vector<victim> & out) const {
         out.clear();
 
         size_t n_cur = n_bytes - std::min(n_bytes, n_freed);
@@ -589,7 +594,7 @@ struct server_cache_disk::state {
         std::sort(order.begin(), order.end(), [](const victim & a, const victim & b) { return a.t_used < b.t_used; });
 
         for (auto & v : order) {
-            if (n_cur + n_needed <= n_bytes_max) {
+            if (n_cur + n_needed <= n_bytes_max || v.t_used >= t_before) {
                 break;
             }
             n_cur -= std::min(n_cur, v.n_bytes);
@@ -1028,6 +1033,14 @@ struct server_cache_disk::state {
             ok = write_all(fd, trl.buf.data(), trl.buf.size(), abort, nullptr);
         }
 
+        if (ok) {
+            const struct timespec ts[2] = {
+                { (time_t) (job.t_used / 1000000000), (long) (job.t_used % 1000000000) },
+                { (time_t) (job.t_used / 1000000000), (long) (job.t_used % 1000000000) },
+            };
+            futimens(fd, ts);
+        }
+
         ok = ok && fsync(fd) == 0;
 
         if (!ok) {
@@ -1092,11 +1105,11 @@ struct server_cache_disk::state {
                 }
             }
 
-            // then the least recently used entries; if the entries that are kept (live or being read) leave no room,
-            // the write is skipped and the entry stays in RAM
+            // then the entries used less recently than this one; if the entries that are kept (live, being read, or
+            // used more recently) leave no room, the write is skipped and the entry stays in RAM
             std::vector<victim> victims;
-            if (!plan_evict_locked(job.n_bytes, n_freed, superseded, victims)) {
-                DSK_WRN("no room for entry %s (%.3f MiB): the live entries fill the disk cache limit (%.3f of %.3f MiB), skipping\n",
+            if (!plan_evict_locked(job.n_bytes, n_freed, superseded, job.t_used, victims)) {
+                DSK_WRN("no room for entry %s (%.3f MiB): live or more recently used entries fill the disk cache limit (%.3f of %.3f MiB), skipping\n",
                         hex64(job.id).c_str(), job.n_bytes / (1024.0 * 1024.0), n_bytes / (1024.0 * 1024.0), n_bytes_max / (1024.0 * 1024.0));
                 st.n_write_no_room++;
                 return;
@@ -1175,7 +1188,7 @@ struct server_cache_disk::state {
             st.n_removed_superseded++;
         }
 
-        index_put(e, time_now_ns());
+        index_put(e, job.t_used);
 
         st.n_writes++;
         st.n_bytes_written += job.n_bytes;
@@ -1627,7 +1640,7 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     // the bound may be lower than in the previous run
     {
         std::vector<state::victim> victims;
-        s.plan_evict_locked(0, 0, {}, victims);
+        s.plan_evict_locked(0, 0, {}, INT64_MAX, victims);
         s.evict_locked(victims, files);
     }
 
@@ -1695,6 +1708,7 @@ void server_cache_disk::stage_locked(const server_prompt_cache_state & state, bo
     }
     w.job.n_bytes = file_size_of(tokens.size(), w.job.ckpts.size(), n_payload);
     w.job.tokens  = std::move(tokens);
+    w.job.t_used  = time_now_ns();
 
     w.t_staged_ms = ggml_time_ms();
     w.t_due_ms    = released ? w.t_staged_ms : w.t_staged_ms + st->t_delay_ms;

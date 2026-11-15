@@ -145,9 +145,13 @@ def test_conversations_beyond_ram_limit():
         assert body["timings"]["cache_n"] >= n[i] - 1
 
 
-# the bound evicts the least recently used entries and keeps the one a slot continues
-def test_bound_evicts_oldest_keeps_live():
+# the bound evicts the least recently used entries and keeps the one a slot continues; with a writer that lags behind
+# (it writes the most recently saved entries first) the order is still the order of use
+@pytest.mark.parametrize("write_delay", [None, "200"])
+def test_bound_evicts_oldest_keeps_live(monkeypatch, write_delay):
     global server
+    if write_delay:
+        monkeypatch.setenv("LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS", write_delay)
     server.n_slots = 2
     server.n_ctx = 4096
     server.cache_dir_max = 1 # MiB, about two of these conversations
@@ -162,11 +166,17 @@ def test_bound_evicts_oldest_keeps_live():
     for p in others:
         complete(p, id_slot=1)
     complete(OTHER_PROMPT, id_slot=1)
-    wait_entries(2)
-    time.sleep(0.5)
 
-    out = log.wait_for("evicting entry")
-    assert "evicting entry" in out
+    # five entries written or found no room for: the live one and the four others; an entry evicts only entries used
+    # less recently than itself, so a lagging writer skips the older ones instead of evicting the newer ones
+    t0 = time.time()
+    while True:
+        st = cache_status()["disk"]
+        if st["backlog_entries"] == 0 and st["writes"] + st["writes_no_room"] >= 5:
+            break
+        assert time.time() - t0 < 20, st
+        time.sleep(0.05)
+    assert st["removed_evicted"] + st["writes_no_room"] == 3
     assert len(entry_files()) <= 2
 
     restart()
