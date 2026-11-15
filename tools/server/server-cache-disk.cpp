@@ -410,16 +410,19 @@ struct server_cache_disk::state {
 
     std::function<void(uint64_t)> on_loaded;
 
-    // test only: delay of the reader after a read and of the writer before a write
+#ifdef LLAMA_SERVER_TEST_HOOKS
+    // test builds only (-DLLAMA_SERVER_TEST_HOOKS=ON), see open():
+    // delay of the reader after a read and of the writer before a write
     // (env LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS, LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS)
     int64_t t_test_read_delay_ms  = 0;
     int64_t t_test_write_delay_ms = 0;
 
-    // test only: every write fails with this errno once its header is written (env LLAMA_SERVER_TEST_CACHE_DISK_WRITE_ERRNO)
+    // every write fails with this errno once its header is written (env LLAMA_SERVER_TEST_CACHE_DISK_WRITE_ERRNO)
     int test_write_errno = 0;
 
-    // test only: every read fails with std::bad_alloc (env LLAMA_SERVER_TEST_CACHE_DISK_READ_THROW)
+    // every read fails with std::bad_alloc (env LLAMA_SERVER_TEST_CACHE_DISK_READ_THROW)
     bool test_read_throw = false;
+#endif
 
     mutable std::mutex mtx;
     mutable std::condition_variable cv_jobs;   // writer and reader wait for work
@@ -1123,10 +1126,12 @@ struct server_cache_disk::state {
 
         bool ok = write_all(fd, hdr.buf.data(),  hdr.buf.size(),  abort, nullptr);
 
+#ifdef LLAMA_SERVER_TEST_HOOKS
         if (ok && test_write_errno != 0) {
             errno = test_write_errno;
             ok    = false;
         }
+#endif
 
         ok = ok && write_all(fd, meta.buf.data(), meta.buf.size(), abort, nullptr)
                 && write_all(fd, job.data->main.data(), job.data->main.size(), abort, &hp)
@@ -1242,10 +1247,12 @@ struct server_cache_disk::state {
 
         const int64_t t_start = ggml_time_us();
 
+#ifdef LLAMA_SERVER_TEST_HOOKS
         // a hung disk, interrupted by an abort like a write
         for (int64_t t = 0; t < t_test_write_delay_ms && !abort.load(); t += 10) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+#endif
 
         std::string err;
         bool dir_missing = false;
@@ -1508,9 +1515,11 @@ struct server_cache_disk::state {
             bool exception = false; // e.g. std::bad_alloc: the entry may be fine, it stays indexed
 #ifndef _WIN32
             try {
+#ifdef LLAMA_SERVER_TEST_HOOKS
                 if (test_read_throw) {
                     throw std::bad_alloc();
                 }
+#endif
                 res->ok = read_full(id, *res, corrupt);
             } catch (const std::exception & e) {
                 DSK_ERR("failed to read entry %s: %s\n", hex64(id).c_str(), e.what());
@@ -1520,9 +1529,11 @@ struct server_cache_disk::state {
             }
 #endif
 
+#ifdef LLAMA_SERVER_TEST_HOOKS
             if (t_test_read_delay_ms > 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(t_test_read_delay_ms));
             }
+#endif
 
             const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
@@ -1699,6 +1710,7 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     s.t_wait_max_ms = t_wait_max_ms;
     s.on_loaded   = std::move(on_loaded);
 
+#ifdef LLAMA_SERVER_TEST_HOOKS
     if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS")) {
         s.t_test_read_delay_ms = atoll(v);
         DSK_WRN("test: the reader waits %" PRId64 " ms after each read\n", s.t_test_read_delay_ms);
@@ -1715,6 +1727,7 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
         s.t_test_write_delay_ms = atoll(v);
         DSK_WRN("test: the writer waits %" PRId64 " ms before each write\n", s.t_test_write_delay_ms);
     }
+#endif
     s.st.n_bytes_max = n_bytes_max;
 
     // index the entries: headers and tokens only

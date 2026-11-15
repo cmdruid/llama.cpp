@@ -804,8 +804,10 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
         this->n_swa        = n_swa;
 
-        // test only: every restore fails, as for a state that does not fit
+#ifdef LLAMA_SERVER_TEST_HOOKS
+        // test builds only: every restore fails, as for a state that does not fit
         this->test_restore_fail = getenv("LLAMA_SERVER_TEST_CACHE_RESTORE_FAIL") != nullptr;
+#endif
     }
 
     std::list<server_prompt_cache_state> states;
@@ -819,7 +821,9 @@ struct server_prompt_cache {
     // the SWA window of the context, 0 = none (see server_context_impl::n_swa)
     int32_t n_swa = 0;
 
+#ifdef LLAMA_SERVER_TEST_HOOKS
     bool test_restore_fail = false;
+#endif
 
     size_t size() const;
 

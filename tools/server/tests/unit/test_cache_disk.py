@@ -11,6 +11,11 @@ from utils import *
 
 server = ServerPreset.tinyllama2()
 
+# fault injection (LLAMA_SERVER_TEST_CACHE_*) needs a server built with -DLLAMA_SERVER_TEST_HOOKS=ON; set the environment
+# variable LLAMA_SERVER_TEST_HOOKS=1 when running these tests against such a build
+TEST_HOOKS = os.environ.get("LLAMA_SERVER_TEST_HOOKS", "0") not in ("", "0")
+needs_test_hooks = pytest.mark.skipif(not TEST_HOOKS, reason="needs llama-server built with -DLLAMA_SERVER_TEST_HOOKS=ON (and LLAMA_SERVER_TEST_HOOKS=1)")
+
 
 class LogReader:
     def __init__(self, path):
@@ -147,7 +152,7 @@ def test_conversations_beyond_ram_limit():
 
 # the bound evicts the least recently used entries and keeps the one a slot continues; with a writer that lags behind
 # (it writes the most recently saved entries first) the order is still the order of use
-@pytest.mark.parametrize("write_delay", [None, "200"])
+@pytest.mark.parametrize("write_delay", [None, pytest.param("200", marks=needs_test_hooks)])
 def test_bound_evicts_oldest_keeps_live(monkeypatch, write_delay):
     global server
     if write_delay:
@@ -449,6 +454,7 @@ READ_DELAY_ENV = "LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS"
 
 # an entry superseded while the reader loads it: the waiting request gets the loaded state, the entry is removed once
 # the load ends, and a later eviction does not trip over it (it used to crash the server)
+@needs_test_hooks
 def test_superseded_while_loading(monkeypatch):
     global server
     server.start()
@@ -866,6 +872,7 @@ RESTORE_FAIL_ENV = "LLAMA_SERVER_TEST_CACHE_RESTORE_FAIL"
 
 # a restore that fails does not prove the entry bad: the request proceeds cold, the disk copy is kept and is not
 # offered again by this server; a later run restores it
+@needs_test_hooks
 def test_restore_failure_keeps_disk_entry(monkeypatch):
     global server
     server.start()
@@ -933,6 +940,7 @@ WRITE_DELAY_ENV = "LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS"
 
 # the entries that the RAM cache drops are held by the writer until they are written: at most one at a time, the
 # server loop waits for the writer before it hands it another
+@needs_test_hooks
 def test_backlog_bounded_beyond_ram(monkeypatch):
     global server
     monkeypatch.setenv(WRITE_DELAY_ENV, "1500")
@@ -965,6 +973,7 @@ def test_backlog_bounded_beyond_ram(monkeypatch):
 
 
 # a task waiting for a disk read is cancelled (the client went away): its row and the read result are released
+@needs_test_hooks
 def test_cancelled_waiting_task_releases_read(monkeypatch):
     global server
     import requests
@@ -998,6 +1007,7 @@ def test_cancelled_waiting_task_releases_read(monkeypatch):
 
 
 # going to sleep does not wait for the disk writer with the task queue locked: HTTP requests are answered meanwhile
+@needs_test_hooks
 def test_sleep_does_not_wait_for_writer(monkeypatch):
     global server
     monkeypatch.setenv(WRITE_DELAY_ENV, "3000")
@@ -1019,6 +1029,7 @@ def test_sleep_does_not_wait_for_writer(monkeypatch):
 
 
 # a failed write (ENOSPC injected) leaves no file, is not indexed, is counted, and the entry stays in RAM
+@needs_test_hooks
 def test_write_error(monkeypatch):
     global server
     import errno
@@ -1049,6 +1060,7 @@ def test_write_error(monkeypatch):
 
 # the file of an entry is removed while the reader loads it: the load completes from the open file, the waiting request
 # gets the state, and the entry is dropped from the index afterwards
+@needs_test_hooks
 def test_removed_while_loading(monkeypatch):
     global server
     server.start()
@@ -1071,6 +1083,7 @@ def test_removed_while_loading(monkeypatch):
 
 
 # a graceful shutdown while the reader loads an entry: the server stops cleanly, within the persist timeout
+@needs_test_hooks
 def test_shutdown_while_loading(monkeypatch):
     global server
     server.start()
@@ -1204,6 +1217,7 @@ READ_THROW_ENV = "LLAMA_SERVER_TEST_CACHE_DISK_READ_THROW"
 
 # a read that fails (std::bad_alloc injected) of an entry superseded during the read: the entry is still removed when
 # the read ends, it does not stay in the index (counted in the bound, never offered nor evicted)
+@needs_test_hooks
 def test_failed_read_of_superseded_entry_is_removed(monkeypatch):
     global server
     server.start()
@@ -1241,6 +1255,7 @@ WRITE_DELAY_ENV_ = "LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS"
 
 # the removal of an entry superseded while it was read applies to that record only: the same entry written again while
 # the read ended keeps its new file
+@needs_test_hooks
 def test_remove_applies_to_its_record(monkeypatch):
     global server
     server.cache_dir_delay = 60
@@ -1284,6 +1299,7 @@ def test_remove_applies_to_its_record(monkeypatch):
 
 # a hung disk: the server loop waits for the writer once (--cache-persist-timeout), then drops the entries the RAM cache
 # evicts without waiting until the writer finishes a write
+@needs_test_hooks
 def test_stalled_writer_drops_without_waiting(monkeypatch):
     global server
     monkeypatch.setenv(WRITE_DELAY_ENV_, "20000")
@@ -1415,6 +1431,7 @@ def test_ram_hit_before_write_is_its_last_use():
 
 # write-ahead: above 80 % of --cache-ram the least recently used entries are written before their delay, so that an
 # eviction finds them on disk instead of waiting for the writer (it used to wait for the previous eviction's write)
+@needs_test_hooks
 def test_write_ahead_avoids_backlog_wait(monkeypatch):
     global server
     monkeypatch.setenv(WRITE_DELAY_ENV_, "1500")
@@ -1434,6 +1451,7 @@ def test_write_ahead_avoids_backlog_wait(monkeypatch):
 
 
 # going to sleep never waits for the writer with the task queue locked: an entry that would need a wait is dropped
+@needs_test_hooks
 def test_sleep_never_waits_for_writer(monkeypatch):
     global server
     monkeypatch.setenv(WRITE_DELAY_ENV_, "4000")

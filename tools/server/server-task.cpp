@@ -1963,7 +1963,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const auto & data = it_best->data->main;
 
         const size_t size = data.size();
+#ifdef LLAMA_SERVER_TEST_HOOKS
         const size_t n = test_restore_fail ? 0 : llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+#else
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+#endif
         if (n != size) {
             SRV_ERR("failed to restore state with size %zu\n", size);
 

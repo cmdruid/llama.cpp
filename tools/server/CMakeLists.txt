@@ -39,6 +39,13 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# test builds only: fault injection through environment variables (LLAMA_SERVER_TEST_CACHE_*) and the detailed cache
+# status of GET /cache, for tools/server/tests; never in a production build
+option(LLAMA_SERVER_TEST_HOOKS "llama-server: compile in the hooks of the server tests" OFF)
+if (LLAMA_SERVER_TEST_HOOKS)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SERVER_TEST_HOOKS)
+endif()
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
