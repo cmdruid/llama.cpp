@@ -2652,6 +2652,26 @@ assistant turns after it may be rendered differently when the client sends them 
 - An entry the request continues moves into the slot. A request that branches off a conversation (an edited earlier
   turn) gets a copy: the original stays cached, and the branch is saved as an entry of its own when it leaves the slot.
 
+**Changes for `--cache-ram` alone.** The matching rules above also apply without `--cache-dir`; compared with the
+earlier prompt cache:
+- a slot's conversation is saved before any request that does not continue it takes the slot, stateless tasks
+  (embeddings, rerank) included; it used to be saved only when the slot would lose more than half of its tokens, was
+  picked as least recently used, or was pinned with less than half of its tokens shared, and never for a stateless task;
+- an unpinned request that does not continue the most similar slot takes an empty slot if there is one, instead of
+  truncating that slot;
+- the cache is consulted for every request that is not stateless (pinned slots included), not only when the slot is
+  saved;
+- an entry is a candidate only up to a usable restore point and when it keeps more tokens than the slot; restoring it
+  for less than an eighth of its tokens is skipped unless the request continues it. This replaces the rule that
+  restored the entry with the best common prefix if it shared at least a quarter of its tokens (`f_keep >= 0.25`);
+- an entry that a request branches off is kept, the slot gets a copy (the cache holds both until the branch is
+  evicted or superseded); a restored entry used to leave the cache;
+- a new entry replaces the entries it continues (by their protected prefix), not only those that are prefixes of it;
+- with a unified KV cache, a restore that fails for lack of cells is retried after saving and clearing the other idle
+  slots, and an idle slot is saved before it is purged; an entry that still fails to restore without other slots
+  holding cells is dropped from RAM;
+- `GET /cache`, `POST /cache/persist` (which saves the slots to RAM) and the `prompt_cache_*` metrics are new.
+
 **Disk tier.** Entries are stored in `DIR/<arch>-<hash>/`, where the hash covers everything that shapes a saved state:
 the build (number and commit: an upgraded server starts cold), the model and draft model files (size and hashes of their
 first and last MiB), `--override-kv` values, the context size per sequence, unified KV, the K/V types, flash attention
