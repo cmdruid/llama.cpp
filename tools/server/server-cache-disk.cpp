@@ -289,13 +289,23 @@ struct server_cache_disk::state {
 
     std::function<void(uint64_t)> on_loaded;
 
+    // test only: delay of the reader after a read (env LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS)
+    int64_t t_test_read_delay_ms = 0;
+
     mutable std::mutex mtx;
     mutable std::condition_variable cv_jobs;   // writer and reader wait for work
     mutable std::condition_variable cv_done;   // wait() and stop() wait for progress
 
+    // an indexed entry and its last use
+    // the index is only changed by index_put(), index_touch() and index_erase(), so that it and the LRU order agree
+    struct record {
+        entry_ptr e;
+        int64_t   t_used   = 0;     // ns since epoch
+        bool      removing = false; // superseded or removed while it is loaded: removed when the load ends
+    };
+
     // guarded by mtx
-    std::map<uint64_t, entry_ptr> index;
-    std::map<uint64_t, int64_t>   t_used;      // last use, ns since epoch
+    std::map<uint64_t, record>    index;
     size_t                        n_bytes = 0; // sum of the indexed file sizes
     std::vector<llama_tokens>     live;        // the conversations of the slots
     std::set<uint64_t>            loading;     // reads requested or in progress
@@ -321,6 +331,51 @@ struct server_cache_disk::state {
         return dir + "/" + hex64(id) + ".bin";
     }
 
+    void index_put(entry_ptr e, int64_t t_used) {
+        const uint64_t id = e->id;
+        index_erase(id);
+        n_bytes += e->n_bytes;
+        index[id] = record { std::move(e), t_used, false };
+    }
+
+    void index_touch(uint64_t id, int64_t t_used) {
+        if (auto it = index.find(id); it != index.end()) {
+            it->second.t_used = t_used;
+        }
+    }
+
+    // returns false if the entry is not indexed
+    bool index_erase(uint64_t id) {
+        auto it = index.find(id);
+        if (it == index.end()) {
+            return false;
+        }
+        n_bytes -= it->second.e->n_bytes;
+        index.erase(it);
+        return true;
+    }
+
+    // the entry is not offered to requests: being removed
+    bool is_removing_locked(uint64_t id) const {
+        auto it = index.find(id);
+        return it != index.end() && it->second.removing;
+    }
+
+    // remove an entry and its file; an entry that is being loaded is removed when the load ends, the load completes
+    // and its state is still valid for the request that waits for it
+    void remove_locked(uint64_t id, std::vector<std::string> & files) {
+        auto it = index.find(id);
+        if (it == index.end()) {
+            return;
+        }
+        if (loading.count(id)) {
+            it->second.removing = true;
+            return;
+        }
+        index_erase(id);
+        files.push_back(path_of(id));
+    }
+
     // the oldest entries that are neither live nor loading, until n_needed more bytes fit
     // caller holds mtx, the files are removed by the caller without the lock
     void evict_locked(size_t n_needed, std::vector<std::string> & files) {
@@ -329,8 +384,11 @@ struct server_cache_disk::state {
         }
 
         std::vector<std::pair<int64_t, uint64_t>> order;
-        for (const auto & [id, t] : t_used) {
-            order.emplace_back(t, id);
+        for (const auto & [id, r] : index) {
+            if (r.removing || loading.count(id) || is_live_locked(*r.e)) {
+                continue;
+            }
+            order.emplace_back(r.t_used, id);
         }
         std::sort(order.begin(), order.end());
 
@@ -338,12 +396,9 @@ struct server_cache_disk::state {
             if (n_bytes + n_needed <= n_bytes_max) {
                 break;
             }
-            if (is_live_locked(*index[id]) || loading.count(id)) {
-                continue;
-            }
-            DSK_INF("evicting entry %s (%zu tokens, %.3f MiB)\n", hex64(id).c_str(),
-                    index[id]->prompt.tokens.size(), index[id]->n_bytes / (1024.0 * 1024.0));
-            erase_locked(id, files);
+            const auto & e = *index.at(id).e;
+            DSK_INF("evicting entry %s (%zu tokens, %.3f MiB)\n", hex64(id).c_str(), e.prompt.tokens.size(), e.n_bytes / (1024.0 * 1024.0));
+            remove_locked(id, files);
             st.n_removed_evicted++;
         }
     }
@@ -358,17 +413,6 @@ struct server_cache_disk::state {
             }
         }
         return false;
-    }
-
-    void erase_locked(uint64_t id, std::vector<std::string> & files) {
-        auto it = index.find(id);
-        if (it == index.end()) {
-            return;
-        }
-        n_bytes -= it->second->n_bytes;
-        index.erase(it);
-        t_used.erase(id);
-        files.push_back(path_of(id));
     }
 
     void set_error_locked(const std::string & msg) {
@@ -758,8 +802,8 @@ struct server_cache_disk::state {
         {
             std::unique_lock<std::mutex> lock(mtx);
 
-            if (index.count(job.id)) {
-                t_used[job.id] = time_now_ns();
+            if (index.count(job.id) && !index.at(job.id).removing) {
+                index_touch(job.id, time_now_ns());
                 st.n_write_skipped++;
                 return;
             }
@@ -812,23 +856,20 @@ struct server_cache_disk::state {
         }
 
         // the entries that the new one continues are contained in it
-        for (auto it = index.begin(); it != index.end();) {
-            const auto & cur = it->second;
-            if (cur->prompt.is_continued_by(e->prompt.tokens)) {
-                DSK_INF("removing entry %s (%zu tokens), superseded by %s\n", hex64(cur->id).c_str(), cur->prompt.tokens.size(), hex64(job.id).c_str());
-                n_bytes -= cur->n_bytes;
-                t_used.erase(cur->id);
-                files.push_back(path_of(cur->id));
-                it = index.erase(it);
-                st.n_removed_superseded++;
-            } else {
-                ++it;
+        std::vector<uint64_t> superseded;
+        for (const auto & [id, r] : index) {
+            if (id != job.id && !r.removing && r.e->prompt.is_continued_by(e->prompt.tokens)) {
+                superseded.push_back(id);
             }
         }
+        for (const uint64_t id : superseded) {
+            DSK_INF("removing entry %s (%d tokens), superseded by %s%s\n", hex64(id).c_str(), index.at(id).e->prompt.n_tokens(),
+                    hex64(job.id).c_str(), loading.count(id) ? " once it is loaded" : "");
+            remove_locked(id, files);
+            st.n_removed_superseded++;
+        }
 
-        index[job.id]  = e;
-        t_used[job.id] = time_now_ns();
-        n_bytes += job.n_bytes;
+        index_put(e, time_now_ns());
 
         st.n_writes++;
         st.n_bytes_written += job.n_bytes;
@@ -914,22 +955,35 @@ struct server_cache_disk::state {
             res->ok = read_full(id, *res, corrupt);
 #endif
 
+            if (t_test_read_delay_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(t_test_read_delay_ms));
+            }
+
             const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
             std::vector<std::string> files;
+            bool touch = false;
             {
                 std::unique_lock<std::mutex> lock(mtx);
 
                 size_t n_bytes_entry = 0;
                 if (auto it = index.find(id); it != index.end()) {
-                    n_bytes_entry = it->second->n_bytes;
+                    n_bytes_entry = it->second.e->n_bytes;
+                }
+
+                // the load is over: an entry superseded or removed meanwhile goes now
+                const bool removing = is_removing_locked(id);
+                loading.erase(id);
+                if (removing) {
+                    remove_locked(id, files);
                 }
 
                 if (res->ok) {
                     st.n_reads++;
                     st.n_bytes_read += n_bytes_entry;
                     st.t_read_ms    += t_ms;
-                    t_used[id] = time_now_ns();
+                    index_touch(id, time_now_ns());
+                    touch = index.count(id) > 0;
                     DSK_INF("read entry %s: %zu tokens, %.3f MiB in %.2f ms\n", hex64(id).c_str(), res->tokens.size(), n_bytes_entry / (1024.0 * 1024.0), t_ms);
                 } else {
                     st.n_read_errors++;
@@ -937,7 +991,7 @@ struct server_cache_disk::state {
                         DSK_ERR("entry %s is corrupt, removing it\n", hex64(id).c_str());
                         set_error_locked("corrupt entry " + hex64(id));
                         st.n_removed_corrupt++;
-                        erase_locked(id, files);
+                        remove_locked(id, files);
                     } else if (!abort.load()) {
                         DSK_ERR("failed to read entry %s\n", hex64(id).c_str());
                         set_error_locked("cannot read entry " + hex64(id));
@@ -946,13 +1000,12 @@ struct server_cache_disk::state {
                 }
 
                 loaded[id] = res;
-                loading.erase(id);
             }
 
             unlink_files(files);
 
 #ifndef _WIN32
-            if (res->ok) {
+            if (touch) {
                 utimensat(AT_FDCWD, path_of(id).c_str(), nullptr, 0);
             }
 #endif
@@ -1070,6 +1123,11 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     s.key_hash    = key_hash;
     s.n_bytes_max = n_bytes_max;
     s.on_loaded   = std::move(on_loaded);
+
+    if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS")) {
+        s.t_test_read_delay_ms = atoll(v);
+        DSK_WRN("test: the reader waits %" PRId64 " ms after each read\n", s.t_test_read_delay_ms);
+    }
     s.st.n_bytes_max = n_bytes_max;
 
     // index the entries: headers and tokens only
@@ -1104,9 +1162,7 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
             continue;
         }
 
-        s.n_bytes += e->n_bytes;
-        s.t_used[e->id] = mtime_ns;
-        s.index[e->id]  = std::move(e);
+        s.index_put(std::move(e), mtime_ns);
     }
 
     // the bound may be lower than in the previous run
@@ -1179,8 +1235,10 @@ std::vector<server_cache_disk::entry_ptr> server_cache_disk::entries() const {
 
     std::vector<entry_ptr> res;
     res.reserve(st->index.size());
-    for (const auto & [id, e] : st->index) {
-        res.push_back(e);
+    for (const auto & [id, r] : st->index) {
+        if (!r.removing) {
+            res.push_back(r.e);
+        }
     }
     return res;
 }
@@ -1192,7 +1250,7 @@ bool server_cache_disk::load_async(uint64_t id) {
         return true;
     }
 
-    if (st->stopping || !st->index.count(id)) {
+    if (st->stopping || !st->index.count(id) || st->is_removing_locked(id)) {
         return false;
     }
 
@@ -1242,7 +1300,7 @@ void server_cache_disk::touch(uint64_t id) {
         return;
     }
 
-    st->t_used[id] = time_now_ns();
+    st->index_touch(id, time_now_ns());
 
     write_job job;
     job.type = write_job::TOUCH;
@@ -1261,13 +1319,18 @@ void server_cache_disk::remove(uint64_t id) {
         return;
     }
 
-    std::vector<std::string> files;
-    st->erase_locked(id, files);
-    if (files.empty()) {
+    if (!st->index.count(id)) {
         return;
     }
 
     DSK_WRN("removing entry %s\n", hex64(id).c_str());
+
+    // an entry that is being loaded is removed by the reader when the load ends
+    std::vector<std::string> files;
+    st->remove_locked(id, files);
+    if (files.empty()) {
+        return;
+    }
 
     write_job job;
     job.type = write_job::REMOVE;

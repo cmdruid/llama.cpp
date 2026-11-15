@@ -1,6 +1,7 @@
 import glob
 import os
 import tempfile
+import threading
 import time
 import pytest
 from utils import *
@@ -400,3 +401,83 @@ def test_disabled_without_cache_ram():
     assert res.status_code == 200
     assert res.body["disk"] is False
     assert entry_files() == []
+
+
+def cache_status():
+    res = server.make_request("GET", "/cache")
+    assert res.status_code == 200
+    return res.body
+
+
+class Background:
+    """a request in a thread of its own"""
+    def __init__(self, fn, *args, **kwargs):
+        self.result = None
+        self.error = None
+        def run():
+            try:
+                self.result = fn(*args, **kwargs)
+            except Exception as e:
+                self.error = e
+        self.thread = threading.Thread(target=run)
+        self.thread.start()
+    def join(self, timeout=30):
+        self.thread.join(timeout)
+        assert not self.thread.is_alive()
+        if self.error:
+            raise self.error
+        return self.result
+
+
+READ_DELAY_ENV = "LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS"
+
+
+# an entry superseded while the reader loads it: the waiting request gets the loaded state, the entry is removed once
+# the load ends, and a later eviction does not trip over it (it used to crash the server)
+def test_superseded_while_loading(monkeypatch):
+    global server
+    server.start()
+    complete(LONG_PROMPT)
+    restart() # SIGTERM persists the slot
+    assert len(entry_files()) == 1
+    path_long = entry_files()[0]
+    server.stop()
+
+    monkeypatch.setenv(READ_DELAY_ENV, "3000")
+    server.cache_dir_max = 1 # MiB, about two of the conversations below
+    server.start()
+    log = LogReader(server.log_path)
+    n_long = n_tokens(LONG_PROMPT)
+
+    # A waits for the disk read
+    a = Background(complete, LONG_PROMPT + " A")
+    assert "reading disk cache entry" in log.wait_for("reading disk cache entry")
+
+    # B takes the slot meanwhile and is persisted: its entry supersedes the one being read
+    complete(LONG_PROMPT + " B", cache_prompt=False)
+    res = server.make_request("POST", "/cache/persist")
+    assert res.status_code == 200 and res.body["flushed"]
+
+    # removing the entry waits for the end of the load
+    assert path_long in entry_files()
+    assert cache_status()["disk"]["loading"] == 1
+
+    body = a.join()
+    assert body["timings"]["cache_n"] >= n_long
+    assert path_long not in entry_files()
+
+    # the superseded entry is gone from the index and from the directory
+    st = cache_status()["disk"]
+    assert st["removed_superseded"] == 1
+    assert st["entries"] == len(entry_files())
+
+    # enough new conversations to evict: the server survives and stays within the bound
+    for i in range(5):
+        complete(conversation(i, 4))
+        res = server.make_request("POST", "/cache/persist")
+        assert res.status_code == 200
+    assert "evicting entry" in log.wait_for("evicting entry")
+    st = cache_status()["disk"]
+    assert st["entries"] == len(entry_files())
+    assert st["bytes"] <= st["limit_bytes"]
+    assert server.process.poll() is None

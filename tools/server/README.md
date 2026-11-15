@@ -2650,8 +2650,9 @@ key is written to `IDENTITY`). A state is only loaded by a server with the same 
 Files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is removed, never loaded.
 At start-up only the headers and tokens are read. A request that a disk entry serves better than RAM waits while the
 entry is read in the background (other requests are not blocked), then it is restored as from RAM; the disk copy is
-kept. The directory is bounded by `--cache-dir-max`, least recently used first; the entries of live conversations are
-not evicted. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
+kept. An entry superseded by a newer one while it is being read is removed when the read ends; the waiting request
+still gets its state. The directory is bounded by `--cache-dir-max`, least recently used first; the entries of live
+conversations are not evicted. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
 
 ## Sleeping on Idle
 

@@ -26,6 +26,8 @@
 // - files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is detected by its
 //   exact length and checksums, removed and never loaded
 // - the directory is bounded by size, least recently used first (file mtime), the entries of live slots are kept
+// - an entry superseded or removed while it is being read is removed when the read ends: the read completes and the
+//   request waiting for it gets the state
 //
 // threads: the server loop calls every public method; the writer and the reader threads do the file I/O
 // all mutable fields of `state` are guarded by state::mtx, which is never held during file I/O
