@@ -369,7 +369,8 @@ def test_sleep_persists():
     while "persist before sleep" not in log.drain():
         assert time.time() - t0 < 10
         time.sleep(0.1)
-    wait_entries(1)
+    wait_disk("writes", 1) # the file is renamed into place before the counter moves
+    assert len(entry_files()) == 1
 
     res = server.make_request("GET", "/cache")
     assert res.status_code == 200
