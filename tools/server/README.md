@@ -169,6 +169,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
+| `--cache-dir PATH` | directory of the disk tier of the prompt cache: every cache entry is also written there and reused after a restart<br/>entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DIR) |
+| `--cache-dir-max N` | size limit of the disk tier of the prompt cache in MiB, least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
+| `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
@@ -1252,6 +1255,14 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
+| `llamacpp:prompt_cache_saves_total` | Counter | Prompt cache entries saved from a slot. |
+| `llamacpp:prompt_cache_hits_ram_total` | Counter | Prompt cache entries restored into a slot. |
+| `llamacpp:prompt_cache_hits_disk_total` | Counter | Disk cache entries read into RAM for a request. |
+| `llamacpp:prompt_cache_misses_total` | Counter | Requests for which neither the slot nor the cache had anything to reuse. |
+| `llamacpp:prompt_cache_evictions_total` | Counter | Entries dropped from RAM to fit `--cache-ram` (they remain on disk with `--cache-dir`). |
+| `llamacpp:prompt_cache_ram_entries`, `llamacpp:prompt_cache_ram_bytes` | Gauge | Entries and bytes in the RAM tier. |
+| `llamacpp:prompt_cache_disk_entries`, `llamacpp:prompt_cache_disk_bytes`, `llamacpp:prompt_cache_disk_backlog_bytes` | Gauge | Entries and bytes in the disk tier, bytes waiting to be written (only with `--cache-dir`). |
+| `llamacpp:prompt_cache_disk_writes_total`, `llamacpp:prompt_cache_disk_errors_total`, `llamacpp:prompt_cache_disk_evictions_total` | Counter | Disk tier writes, failed writes and reads, entries removed to fit `--cache-dir-max` (only with `--cache-dir`). |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
@@ -1303,6 +1314,39 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
     "n_erased": 1745
 }
 ```
+
+### GET `/cache`: Prompt cache status
+
+Entries and bytes of the RAM tier (`--cache-ram`) and of the disk tier (`--cache-dir`), the disk writer's backlog,
+counters (`saves`, `hits_ram`, `hits_disk`, `misses`, `evictions_ram`, `failed_restores`, `persists`) with the
+cumulated save and load times, and the length of each slot's conversation. While the server sleeps, only `disk` is
+reported (`"sleeping": true`). Contains no prompt content.
+
+### POST `/cache/persist`: Save the conversations of the slots to the prompt cache
+
+Saves the conversation of every non-empty slot to the prompt cache and, with `--cache-dir`, waits until the disk
+writer has written it (at most `--cache-persist-timeout` seconds). A slot that is processing a task is saved as it
+stands between two decoding steps (counted in `n_busy`); the task is not interrupted. A gateway calls this before it
+stops the server; the server does the same on a graceful shutdown (SIGTERM) and before it goes to sleep.
+
+**Response format**
+
+```json
+{
+    "n_saved": 1,
+    "n_cached": 0,
+    "n_failed": 0,
+    "n_busy": 0,
+    "n_bytes": 3611820032,
+    "save_ms": 1850.2,
+    "disk": true,
+    "flushed": true,
+    "total_ms": 3402
+}
+```
+
+`n_cached` counts slots whose conversation was already in the cache, `n_failed` slots that could not be saved (a state
+larger than `--cache-ram`). `flushed` is false if the writer did not finish in time.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
@@ -2579,6 +2623,35 @@ Example of an error:
     }
 }
 ```
+
+## Prompt cache
+
+With `--cache-ram` (default 8192 MiB) the server keeps the state of conversations that leave a slot in RAM, and a
+later request that continues one restores it instead of re-processing its prompt. With `--cache-dir DIR` every entry
+is also written to disk by a background thread, so conversations beyond `--cache-ram` stay resumable and survive a
+restart. No session or slot id is needed: a conversation is recognized by the tokens it starts with.
+
+**Matching.** A conversation's protected prefix runs to the end of its last message that is not the assistant's (all
+tokens for a prompt without chat message spans). A request *continues* a conversation if it keeps that prefix; the
+assistant turns after it may be rendered differently when the client sends them back.
+- Before a slot is given to a request that does not continue it, the slot's conversation is saved to the cache.
+  A request that does not continue the most similar slot takes an empty slot if there is one.
+- An entry is restored for a request only up to a usable restore point: the common prefix if the saved state can be
+  truncated there, otherwise (SWA, recurrent and hybrid models) the last context checkpoint before the point where the
+  request diverges. The entry that keeps the most tokens wins, if it keeps more than the slot already holds.
+  Restoring an entry for less than an eighth of its tokens is skipped unless the request continues it.
+- An entry the request continues moves into the slot. A request that branches off a conversation (an edited earlier
+  turn) gets a copy: the original stays cached, and the branch is saved as an entry of its own when it leaves the slot.
+
+**Disk tier.** Entries are stored in `DIR/<arch>-<hash>/`, where the hash covers everything that shapes a saved state:
+the model and draft model files (size and hashes of their first and last MiB), the context size per sequence, unified
+KV, the K/V types, flash attention, SWA, RoPE settings, LoRA adapters, control vectors and the speculative types (the
+key is written to `IDENTITY`). A state is only loaded by a server with the same key; several keys can share `DIR`.
+Files are written to a temporary name, synced and renamed; a torn, truncated or corrupt file is removed, never loaded.
+At start-up only the headers and tokens are read. A request that a disk entry serves better than RAM waits while the
+entry is read in the background (other requests are not blocked), then it is restored as from RAM; the disk copy is
+kept. The directory is bounded by `--cache-dir-max`, least recently used first; the entries of live conversations are
+not evicted. Prompts with media are not written to disk. `GET /cache` and `/metrics` show the tiers at work.
 
 ## Sleeping on Idle
 
