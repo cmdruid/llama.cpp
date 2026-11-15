@@ -75,6 +75,7 @@ struct server_cache_disk_stats {
     uint64_t n_removed_corrupt    = 0;
     uint64_t n_removed_evicted    = 0;
     uint64_t n_removed_superseded = 0;
+    uint64_t n_removed_missing    = 0; // indexed, but the file is gone
 
     uint64_t n_bytes_written = 0;
     uint64_t n_bytes_skipped = 0; // the size of the writes skipped because the entry left the RAM cache

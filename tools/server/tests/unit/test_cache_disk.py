@@ -743,3 +743,88 @@ def test_no_room_skips_write():
     assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in out
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" not in out
     assert body["timings"]["cache_n"] >= n_tokens(other) - 1
+
+
+# an entry whose file is gone: the request waiting for it proceeds cold, the entry is dropped from the index and later
+# requests do not wait for it again
+def test_missing_file_is_dropped():
+    global server
+    server.start()
+    complete(LONG_PROMPT)
+    restart()
+    [path] = entry_files()
+    os.remove(path)
+    log = LogReader(server.log_path)
+
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    out = log.wait_for("dropping it from the index")
+    assert "reading disk cache entry" in out
+    assert "failed to read entry" in out
+    assert body["timings"]["cache_n"] == 0
+    st = cache_status()["disk"]
+    assert st["entries"] == 0
+    assert st["removed_missing"] == 1
+
+    log.drain()
+    complete(LONG_PROMPT + " The knight went home.")
+    assert "reading disk cache entry" not in log.drain()
+
+
+# the cache directory removed while the server runs: it is created again (0700) by the next write, and the entries
+# that went with it are dropped
+def test_removed_directory_is_recreated():
+    global server
+    import shutil, stat
+    server.start()
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT)
+    wait_disk("writes", 1)
+    [key_dir] = key_dirs()
+
+    shutil.rmtree(server.cache_dir)
+
+    complete(conversation(1)) # OTHER is written
+    st = wait_disk("writes", 2)
+    assert st["write_errors"] == 0
+    assert st["entries"] == 1
+    assert st["removed_missing"] == 1
+    assert len(entry_files()) == 1
+    assert os.path.exists(os.path.join(key_dir, "IDENTITY"))
+    assert stat.S_IMODE(os.stat(key_dir).st_mode) == 0o700
+
+    # the lost entry is not waited for (the conversation is still in RAM)
+    log = LogReader(server.log_path)
+    log.drain()
+    complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert "reading disk cache entry" not in log.drain()
+
+
+# a damaged entry is removed when it is read, and the same conversation is written again afterwards: the removal of
+# the old file and the write of the new one happen in order
+def test_corrupt_entry_rewritten():
+    global server
+    server.n_predict = 0
+    server.start()
+    complete(LONG_PROMPT)
+    server.stop()
+
+    [path] = entry_files()
+    size = os.path.getsize(path)
+    with open(path, "r+b") as f:
+        f.seek(size - 64)
+        b = f.read(1)
+        f.seek(size - 64)
+        f.write(bytes([b[0] ^ 0xff]))
+
+    server.start()
+    log = LogReader(server.log_path)
+    complete(LONG_PROMPT)
+    assert "is corrupt, removing it" in log.wait_for("is corrupt, removing it")
+    persist()
+    assert entry_files() == [path]
+    assert cache_status()["disk"]["entries"] == 1
+
+    restart()
+    log = LogReader(server.log_path)
+    complete(LONG_PROMPT)
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")

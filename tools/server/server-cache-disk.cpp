@@ -298,6 +298,7 @@ size_t file_size_of(size_t n_tokens, size_t n_ckpt, size_t n_payload) {
 
 struct server_cache_disk::state {
     std::string dir;
+    std::string key;
     uint64_t    key_hash = 0;
     size_t      n_bytes_max = 0;
 
@@ -350,6 +351,7 @@ struct server_cache_disk::state {
     uint64_t                      cur_id    = 0; // the write in progress, 0 = none
     uint64_t                      cur_flush = 0;
     size_t                        cur_bytes = 0;
+    bool                          cur_removed = false; // remove() was called during the write
     uint64_t                      flush_seq = 0;
     bool                          stopping   = false;
     bool                          writer_exited = false;
@@ -366,6 +368,84 @@ struct server_cache_disk::state {
 
     std::string path_of(uint64_t id) const {
         return dir + "/" + hex64(id) + ".bin";
+    }
+
+    // create the key directory (0700) and its IDENTITY, a description of the key for the operator
+    bool make_dir(std::string & err) const {
+        namespace fs = std::filesystem;
+
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec) {
+            err = "cannot create the cache directory '" + dir + "': " + ec.message();
+            return false;
+        }
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+
+        const std::string path = dir + "/IDENTITY";
+        const std::string tmp  = path + "." + std::to_string(getpid()) + ".tmp";
+
+        FILE * f = fopen(tmp.c_str(), "wb");
+        bool ok = f != nullptr && fwrite(key.data(), 1, key.size(), f) == key.size();
+        ok = (f == nullptr || fclose(f) == 0) && ok;
+        ok = ok && rename(tmp.c_str(), path.c_str()) == 0;
+        if (!ok) {
+            err = "cannot write '" + path + "': " + strerror(errno);
+            unlink(tmp.c_str());
+        }
+        return ok;
+    }
+
+    // drop the index entries whose file is gone, e.g. after the directory was removed
+    // called without the lock: the files are checked without it
+    void prune_missing() {
+        std::vector<std::pair<uint64_t, entry_ptr>> own;
+        std::vector<std::string> other;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            for (const auto & [id, r] : index) {
+                own.emplace_back(id, r.e);
+            }
+            for (const auto & [path, f] : others) {
+                other.push_back(path);
+            }
+        }
+
+        const auto missing = [](const std::string & path) {
+            return access(path.c_str(), F_OK) != 0 && errno == ENOENT;
+        };
+
+        std::vector<std::pair<uint64_t, entry_ptr>> own_missing;
+        std::vector<std::string> other_missing;
+        for (const auto & [id, e] : own) {
+            if (missing(path_of(id))) {
+                own_missing.emplace_back(id, e);
+            }
+        }
+        for (const auto & path : other) {
+            if (missing(path)) {
+                other_missing.push_back(path);
+            }
+        }
+
+        std::unique_lock<std::mutex> lock(mtx);
+        for (const auto & [id, e] : own_missing) {
+            drop_missing_locked(id, e);
+        }
+        for (const auto & path : other_missing) {
+            other_erase(path);
+        }
+    }
+
+    // the file of an indexed entry is gone: forget the entry, unless it was replaced meanwhile
+    void drop_missing_locked(uint64_t id, const entry_ptr & e) {
+        auto it = index.find(id);
+        if (it == index.end() || it->second.e != e || loading.count(id)) {
+            return;
+        }
+        DSK_WRN("entry %s is gone from the disk, dropping it from the index\n", hex64(id).c_str());
+        index_erase(id);
+        st.n_removed_missing++;
     }
 
     void index_put(entry_ptr e, int64_t t_used) {
@@ -805,12 +885,14 @@ struct server_cache_disk::state {
     }
 
     // write an entry: temporary file, fsync, rename, fsync of the directory
-    bool write_file(const write_job & job, std::string & err) const {
+    // dir_missing: the directory is gone, see make_dir()
+    bool write_file(const write_job & job, std::string & err, bool & dir_missing) const {
         const std::string path = path_of(job.id);
         const std::string tmp  = dir + "/." + hex64(job.id) + "." + std::to_string(getpid()) + ".tmp";
 
         const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (fd < 0) {
+            dir_missing = errno == ENOENT;
             err = std::string("cannot create '") + tmp + "': " + strerror(errno);
             return false;
         }
@@ -911,6 +993,7 @@ struct server_cache_disk::state {
 
             if (index.count(job.id) && !index.at(job.id).removing) {
                 index_touch(job.id, time_now_ns());
+                ops.push_back({ file_op::TOUCH, job.id });
                 st.n_write_present++;
                 return;
             }
@@ -955,13 +1038,30 @@ struct server_cache_disk::state {
         const int64_t t_start = ggml_time_us();
 
         std::string err;
-        const bool ok = write_file(job, err);
+        bool dir_missing = false;
+        bool ok = write_file(job, err, dir_missing);
+
+        // the directory was removed under us: create it again, forget the entries that went with it, retry
+        if (!ok && dir_missing) {
+            DSK_WRN("the cache directory '%s' is gone, creating it again\n", dir.c_str());
+            dir_missing = false;
+            ok = make_dir(err);
+            prune_missing();
+            ok = ok && write_file(job, err, dir_missing);
+        }
 
         const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
         std::unique_lock<std::mutex> lock(mtx);
 
         n_bytes -= job.n_bytes;
+
+        // removed by remove() during the write
+        if (ok && cur_removed) {
+            lock.unlock();
+            unlink_files({ path_of(job.id) });
+            return;
+        }
 
         if (!ok) {
             if (!abort.load()) {
@@ -1069,9 +1169,10 @@ struct server_cache_disk::state {
                 const int64_t t_now = ggml_time_ms();
                 if (auto it = pick_locked(t_now); it != staged.end()) {
                     job = std::move(it->second.job);
-                    cur_id    = it->first;
-                    cur_flush = it->second.flush;
-                    cur_bytes = job.n_bytes;
+                    cur_id      = it->first;
+                    cur_flush   = it->second.flush;
+                    cur_bytes   = job.n_bytes;
+                    cur_removed = false;
                     staged_bytes -= job.n_bytes;
                     staged.erase(it);
                     break;
@@ -1099,7 +1200,12 @@ struct server_cache_disk::state {
                         {
 #ifndef _WIN32
                             // the mtime keeps the LRU order across restarts
-                            utimensat(AT_FDCWD, path_of(op.id).c_str(), nullptr, 0);
+                            if (utimensat(AT_FDCWD, path_of(op.id).c_str(), nullptr, 0) != 0 && errno == ENOENT) {
+                                std::unique_lock<std::mutex> lock_st(mtx);
+                                if (auto it = index.find(op.id); it != index.end()) {
+                                    drop_missing_locked(op.id, it->second.e);
+                                }
+                            }
 #endif
                         } break;
                     case file_op::REMOVE:
@@ -1132,7 +1238,8 @@ struct server_cache_disk::state {
 
     void reader_loop() {
         while (true) {
-            uint64_t id = 0;
+            uint64_t  id = 0;
+            entry_ptr e0; // the entry as indexed when the read starts: it may be replaced meanwhile
             {
                 std::unique_lock<std::mutex> lock(mtx);
                 cv_jobs.wait(lock, [&] { return stopping || !load_queue.empty(); });
@@ -1141,6 +1248,9 @@ struct server_cache_disk::state {
                 }
                 id = load_queue.front();
                 load_queue.pop_front();
+                if (auto it = index.find(id); it != index.end()) {
+                    e0 = it->second.e;
+                }
             }
 
             auto res = std::make_shared<loaded_entry>();
@@ -1158,54 +1268,67 @@ struct server_cache_disk::state {
 
             const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
-            std::vector<std::string> files;
-            bool touch = false;
             {
                 std::unique_lock<std::mutex> lock(mtx);
 
-                size_t n_bytes_entry = 0;
-                if (auto it = index.find(id); it != index.end()) {
-                    n_bytes_entry = it->second.e->n_bytes;
-                }
-
-                // the load is over: an entry superseded or removed meanwhile goes now
-                const bool removing = is_removing_locked(id);
                 loading.erase(id);
-                if (removing) {
-                    remove_locked(id, files);
-                }
+
+                // the record that was read, unless a write replaced it meanwhile
+                auto it = index.find(id);
+                const bool same = e0 && it != index.end() && it->second.e == e0;
+
+                const size_t n_bytes_entry = e0 ? e0->n_bytes : 0;
+
+                // the files are removed and touched by the writer, in order with the writes of the same entry
+                std::vector<std::string> files;
+                bool remove = false;
 
                 if (res->ok) {
                     st.n_reads++;
                     st.n_bytes_read += n_bytes_entry;
                     st.t_read_ms    += t_ms;
-                    index_touch(id, time_now_ns());
-                    touch = index.count(id) > 0;
                     DSK_INF("read entry %s: %zu tokens, %.3f MiB in %.2f ms\n", hex64(id).c_str(), res->tokens.size(), n_bytes_entry / (1024.0 * 1024.0), t_ms);
+
+                    // the load is over: an entry superseded or removed meanwhile goes now
+                    remove = same && it->second.removing;
+                    if (same && !remove) {
+                        index_touch(id, time_now_ns());
+                        ops.push_back({ file_op::TOUCH, id });
+                    }
                 } else {
                     st.n_read_errors++;
                     if (corrupt) {
                         DSK_ERR("entry %s is corrupt, removing it\n", hex64(id).c_str());
                         set_error_locked("corrupt entry " + hex64(id));
                         st.n_removed_corrupt++;
-                        remove_locked(id, files);
+                        remove = same;
                     } else if (!abort.load()) {
-                        DSK_ERR("failed to read entry %s\n", hex64(id).c_str());
+                        // the file is missing or unreadable: forget the entry (a restart indexes it again if it is there),
+                        // so that later requests do not wait for it again
+                        DSK_ERR("failed to read entry %s, dropping it from the index\n", hex64(id).c_str());
                         set_error_locked("cannot read entry " + hex64(id));
+                        if (same) {
+                            remove = it->second.removing;
+                            if (!remove) {
+                                index_erase(id);
+                                st.n_removed_missing++;
+                            }
+                        }
                     }
                     res = std::make_shared<loaded_entry>();
+                }
+
+                if (remove) {
+                    remove_locked(id, files);
+                    if (!files.empty()) {
+                        ops.push_back({ file_op::REMOVE, id });
+                    }
                 }
 
                 loaded[id] = res;
             }
 
-            unlink_files(files);
-
-#ifndef _WIN32
-            if (touch) {
-                utimensat(AT_FDCWD, path_of(id).c_str(), nullptr, 0);
-            }
-#endif
+            cv_jobs.notify_all();
 
             {
                 std::unique_lock<std::mutex> lock(mtx_callback);
@@ -1288,37 +1411,25 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     const uint64_t key_hash = server_cache_disk_hash(key.data(), key.size());
     const std::string dir = (fs::path(dir_root) / (key_name + "-" + hex64(key_hash))).string();
 
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) {
-        DSK_ERR("cannot create the cache directory '%s': %s\n", dir.c_str(), ec.message().c_str());
-        return nullptr;
-    }
-    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
-
-    if (access(dir.c_str(), R_OK | W_OK | X_OK) != 0) {
-        DSK_ERR("the cache directory '%s' is not writable: %s\n", dir.c_str(), strerror(errno));
-        return nullptr;
-    }
-
-    // a description of the key, for the operator
-    {
-        const std::string path = dir + "/IDENTITY";
-        const std::string tmp  = path + "." + std::to_string(getpid()) + ".tmp";
-        FILE * f = fopen(tmp.c_str(), "wb");
-        if (f == nullptr || fwrite(key.data(), 1, key.size(), f) != key.size() || fclose(f) != 0 || rename(tmp.c_str(), path.c_str()) != 0) {
-            DSK_ERR("cannot write '%s': %s\n", path.c_str(), strerror(errno));
-            unlink(tmp.c_str());
-            return nullptr;
-        }
-    }
-
     std::unique_ptr<server_cache_disk> res(new server_cache_disk());
     res->path_dir = dir;
     res->st = std::make_shared<state>();
 
     auto & s = *res->st;
     s.dir         = dir;
+    s.key         = key;
+
+    std::error_code ec;
+    if (std::string err; !s.make_dir(err)) {
+        DSK_ERR("%s\n", err.c_str());
+        return nullptr;
+    }
+
+    if (access(dir.c_str(), R_OK | W_OK | X_OK) != 0) {
+        DSK_ERR("the cache directory '%s' is not writable: %s\n", dir.c_str(), strerror(errno));
+        return nullptr;
+    }
+
     s.key_hash    = key_hash;
     s.n_bytes_max = n_bytes_max;
     s.t_delay_ms  = t_delay_ms;
@@ -1607,6 +1718,15 @@ void server_cache_disk::remove(uint64_t id) {
 
     if (st->stopping) {
         return;
+    }
+
+    // a write of the entry not started yet is cancelled, one in progress removes its file when it is done
+    if (auto it = st->staged.find(id); it != st->staged.end()) {
+        st->staged_bytes -= it->second.job.n_bytes;
+        st->staged.erase(it);
+    }
+    if (st->cur_id == id) {
+        st->cur_removed = true;
     }
 
     if (!st->index.count(id)) {

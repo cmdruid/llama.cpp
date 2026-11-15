@@ -1049,6 +1049,7 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"removed_corrupt",    st.n_removed_corrupt},
         {"removed_evicted",    st.n_removed_evicted},
         {"removed_superseded", st.n_removed_superseded},
+        {"removed_missing",    st.n_removed_missing},
         {"bytes_written",   st.n_bytes_written},
         {"bytes_skipped",   st.n_bytes_skipped},
         {"bytes_read",      st.n_bytes_read},
