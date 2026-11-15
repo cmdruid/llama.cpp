@@ -998,3 +998,90 @@ def test_sleep_does_not_wait_for_writer(monkeypatch):
 
     st = wait_disk("writes", 1)
     assert len(entry_files()) == 1
+
+
+# a failed write (ENOSPC injected) leaves no file, is not indexed, is counted, and the entry stays in RAM
+def test_write_error(monkeypatch):
+    global server
+    import errno
+    monkeypatch.setenv("LLAMA_SERVER_TEST_CACHE_DISK_WRITE_ERRNO", str(errno.ENOSPC))
+    server.server_metrics = True
+    server.start()
+    log = LogReader(server.log_path)
+
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT)
+    st = wait_disk("write_errors", 1)
+    assert st["writes"] == 0
+    assert st["entries"] == 0
+    assert st["bytes"] == 0
+    assert "No space left on device" in st["last_error"]
+    assert glob.glob(os.path.join(server.cache_dir, "*", "*.bin")) == []
+    assert glob.glob(os.path.join(server.cache_dir, "*", ".*.tmp")) == []
+
+    res = server.make_request("GET", "/metrics")
+    assert "llamacpp:prompt_cache_disk_errors_total 1" in res.body
+
+    # still in RAM
+    log.drain()
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
+    assert body["timings"]["cache_n"] >= n_tokens(LONG_PROMPT)
+
+
+# the file of an entry is removed while the reader loads it: the load completes from the open file, the waiting request
+# gets the state, and the entry is dropped from the index afterwards
+def test_removed_while_loading(monkeypatch):
+    global server
+    server.start()
+    complete(LONG_PROMPT)
+    restart()
+    [path] = entry_files()
+    server.stop()
+
+    monkeypatch.setenv(READ_DELAY_ENV, "2000")
+    server.start()
+    log = LogReader(server.log_path)
+    a = Background(complete, LONG_PROMPT + " A")
+    assert "reading disk cache entry" in log.wait_for("reading disk cache entry")
+    os.remove(path)
+
+    body = a.join()
+    assert body["timings"]["cache_n"] >= n_tokens(LONG_PROMPT)
+    st = wait_disk("removed_missing", 1)
+    assert st["entries"] == 0
+
+
+# a graceful shutdown while the reader loads an entry: the server stops cleanly, within the persist timeout
+def test_shutdown_while_loading(monkeypatch):
+    global server
+    server.start()
+    complete(LONG_PROMPT)
+    restart()
+    server.stop()
+
+    monkeypatch.setenv(READ_DELAY_ENV, "3000")
+    server.start()
+    log = LogReader(server.log_path)
+
+    # the HTTP thread of a request that is never answered (the server loop stopped) ends when its client goes away
+    def request():
+        import requests
+        try:
+            requests.post(f"http://{server.server_host}:{server.server_port}/completion", json={
+                "prompt": LONG_PROMPT + " A", "cache_prompt": True,
+            }, timeout=5)
+        except requests.exceptions.RequestException:
+            pass
+    a = Background(request)
+    assert "reading disk cache entry" in log.wait_for("reading disk cache entry")
+
+    server.process.terminate()
+    rc = server.process.wait(timeout=20)
+    assert rc == 0
+    server.process = None
+    server_instances.discard(server)
+    a.join()
+    out = open(server.log_path, errors="replace").read()
+    assert "persist before shutdown" in out
+    assert "detaching them" not in out

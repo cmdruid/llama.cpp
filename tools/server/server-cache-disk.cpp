@@ -336,6 +336,9 @@ struct server_cache_disk::state {
     int64_t t_test_read_delay_ms  = 0;
     int64_t t_test_write_delay_ms = 0;
 
+    // test only: every write fails with this errno once its header is written (env LLAMA_SERVER_TEST_CACHE_DISK_WRITE_ERRNO)
+    int test_write_errno = 0;
+
     mutable std::mutex mtx;
     mutable std::condition_variable cv_jobs;   // writer and reader wait for work
     mutable std::condition_variable cv_done;   // wait() and stop() wait for progress
@@ -1000,10 +1003,16 @@ struct server_cache_disk::state {
 
         xxh64 hp;
 
-        bool ok = write_all(fd, hdr.buf.data(),  hdr.buf.size(),  abort, nullptr) &&
-                  write_all(fd, meta.buf.data(), meta.buf.size(), abort, nullptr) &&
-                  write_all(fd, job.data->main.data(), job.data->main.size(), abort, &hp) &&
-                  write_all(fd, job.data->drft.data(), job.data->drft.size(), abort, &hp);
+        bool ok = write_all(fd, hdr.buf.data(),  hdr.buf.size(),  abort, nullptr);
+
+        if (ok && test_write_errno != 0) {
+            errno = test_write_errno;
+            ok    = false;
+        }
+
+        ok = ok && write_all(fd, meta.buf.data(), meta.buf.size(), abort, nullptr)
+                && write_all(fd, job.data->main.data(), job.data->main.size(), abort, &hp)
+                && write_all(fd, job.data->drft.data(), job.data->drft.size(), abort, &hp);
 
         for (const auto & c : job.ckpts) {
             ok = ok && write_all(fd, c->data_tgt.data(),  c->data_tgt.size(),  abort, &hp)
@@ -1539,6 +1548,10 @@ std::unique_ptr<server_cache_disk> server_cache_disk::open(
     if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_READ_DELAY_MS")) {
         s.t_test_read_delay_ms = atoll(v);
         DSK_WRN("test: the reader waits %" PRId64 " ms after each read\n", s.t_test_read_delay_ms);
+    }
+    if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_WRITE_ERRNO")) {
+        s.test_write_errno = atoi(v);
+        DSK_WRN("test: every write fails with errno %d\n", s.test_write_errno);
     }
     if (const char * v = getenv("LLAMA_SERVER_TEST_CACHE_DISK_WRITE_DELAY_MS")) {
         s.t_test_write_delay_ms = atoll(v);

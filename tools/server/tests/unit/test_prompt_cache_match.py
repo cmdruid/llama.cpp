@@ -194,3 +194,67 @@ def test_hybrid_branch_restores_from_checkpoint():
     body = chat(first)
     assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
     assert 0 < body["usage"]["prompt_tokens_details"]["cached_tokens"] < n_first
+
+
+def chat(messages):
+    res = server.make_request("POST", "/chat/completions", data={
+        "messages": messages,
+        "max_tokens": 4,
+    })
+    assert res.status_code == 200
+    return res.body
+
+
+CHAT_HEAD = [
+    {"role": "system", "content": "You are a helpful assistant who tells long stories."},
+    {"role": "user", "content": LONG_PROMPT},
+]
+CHAT_OTHER = [{"role": "user", "content": "The quick brown fox jumps over the lazy dog."}]
+
+
+# chat: the protected prefix of a conversation ends with its last message that is not the assistant's, so a request
+# that sends the assistant turn back rendered differently still continues it: the entry moves into the slot
+def test_chat_reply_rendered_differently_continues():
+    global server
+    server.jinja = True
+    server.start()
+    log = LogReader(server.log_path)
+
+    chat(CHAT_HEAD)
+    slot = server.make_request("GET", "/cache").body["slots"][0]
+    assert 0 < slot["n_protected"] < slot["n_tokens"]
+
+    chat(CHAT_OTHER)
+    log.drain()
+
+    # the client sends back another text for the assistant turn than the one generated
+    body = chat(CHAT_HEAD + [
+        {"role": "assistant", "content": "A reply the model did not write."},
+        {"role": "user", "content": "And then?"},
+    ])
+    out = log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
+    assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in out
+    assert "__TEST_TAG_PROMPT_CACHE_KEEP__" not in out
+    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] >= slot["n_protected"] - 1
+
+    # the entry moved into the slot: the cache holds only the other conversation
+    assert server.make_request("GET", "/cache").body["ram"]["entries"] == 1
+
+
+# chat: a request that edits the last user message does not continue the conversation: it branches off it, and the
+# conversation stays in the cache
+def test_chat_edited_user_message_branches():
+    global server
+    server.jinja = True
+    server.start()
+    log = LogReader(server.log_path)
+
+    chat(CHAT_HEAD)
+    chat(CHAT_OTHER)
+    log.drain()
+
+    edited = [CHAT_HEAD[0], {"role": "user", "content": LONG_PROMPT + " Make it short."}]
+    chat(edited)
+    out = log.wait_for("__TEST_TAG_PROMPT_CACHE_KEEP__")
+    assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in out
+    assert "__TEST_TAG_PROMPT_CACHE_KEEP__" in out
