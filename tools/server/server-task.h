@@ -345,6 +345,20 @@ struct server_task {
     bool is_stateless() const {
         return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK;
     }
+
+    // the part of the prompt that a later request must share to continue this conversation:
+    // up to the end of the last message that is not the assistant's (user, tool or system),
+    // or the whole prompt when it has no message spans
+    // the assistant turns after it may be rendered differently when the client sends them back
+    int32_t n_tokens_protected() const {
+        const auto & spans = params.message_spans.spans;
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->valid() && it->role != COMMON_CHAT_ROLE_ASSISTANT) {
+                return std::min<int32_t>(it->pos + it->len, tokens.size());
+            }
+        }
+        return tokens.size();
+    }
 };
 
 struct result_prompt_progress {
@@ -692,19 +706,35 @@ struct server_prompt {
     // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
+    // the prefix that a request must share to continue this conversation, 0 = all tokens
+    // see server_task::n_tokens_protected()
+    int32_t n_protected = 0;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        n_protected = 0;
     }
 
     int n_tokens() const {
         return tokens.size();
     }
 
+    int32_t n_tokens_protected() const {
+        return n_protected > 0 ? std::min(n_protected, n_tokens()) : n_tokens();
+    }
+
+    // true if a request with these tokens continues this conversation: it keeps the whole protected prefix
+    // a request that does not continue it would discard part of the conversation
+    bool is_continued_by(const server_tokens & tokens_new) const {
+        return (int32_t) tokens.get_common_prefix(tokens_new) >= n_tokens_protected();
+    }
+
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            n_protected,
         };
     }
 };
@@ -722,6 +752,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // the lowest position held by the saved state of the sequence, see llama_memory_seq_pos_min()
+    llama_pos pos_min = 0;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -734,9 +767,10 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t n_swa) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->n_swa        = n_swa;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -747,12 +781,23 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // the SWA window of the context, 0 = none (see server_context_impl::n_swa)
+    int32_t n_swa = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
+    // the number of tokens of `prompt` that a request with `tokens_new` keeps once the state of `prompt` is restored,
+    // pos_min is the lowest position held by that state:
+    // the common prefix if the state can be truncated there, otherwise (SWA, recurrent or hybrid memory) the last
+    // context checkpoint before the point where they diverge, as decided when the prompt is processed
+    int32_t n_usable(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const;
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // restore the entry that the request reuses most, if it reuses more than `prompt` (the slot) already holds
+    // returns false if the state could not be restored
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();

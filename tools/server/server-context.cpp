@@ -366,6 +366,8 @@ struct server_slot {
             return false;
         }
 
+        cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
+
         return true;
     }
 
@@ -1604,7 +1606,7 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, n_swa);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1803,8 +1805,6 @@ private:
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
-        bool update_cache = false;
-
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1815,13 +1815,6 @@ private:
                 }
 
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
-
-                // the similarity search below skips an empty slot and is off with --slot-prompt-similarity 0,
-                // so decide here: consult the prompt cache unless the slot keeps most of its context
-                const size_t n_slot = ret->prompt.tokens.size();
-                const size_t n_lcp  = ret->prompt.tokens.get_common_prefix(task.tokens);
-
-                update_cache = n_slot == 0 || float(n_lcp) / n_slot < 0.5f;
             }
         }
 
@@ -1830,10 +1823,6 @@ private:
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
-                    continue;
-                }
-
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
@@ -1865,14 +1854,19 @@ private:
             if (ret != nullptr) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
-                if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            f_sim_best, slot_prompt_similarity, f_keep);
-                }
+                SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                        f_sim_best, slot_prompt_similarity, f_keep);
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
+                // a request that does not continue the conversation of the slot takes an empty slot if there is one,
+                // instead of displacing that conversation
+                if (!ret->prompt.is_continued_by(task.tokens)) {
+                    const auto free_slots = get_free_slots(1, -1);
+
+                    if (!free_slots.empty() && free_slots[0]->prompt.tokens.empty()) {
+                        SLT_INF(*ret, "%s", "the request does not continue the conversation of the slot, using an empty slot\n");
+
+                        ret = nullptr;
+                    }
                 }
             }
         }
@@ -1885,42 +1879,68 @@ private:
                 ret = free_slots[0];
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
-
-                update_cache = true;
             }
         }
 
-        if (ret) {
-            update_cache = update_cache && prompt_cache;
+        if (ret && prompt_cache) {
+            SRV_TRC("%s", "updating prompt cache\n");
+
+            const int64_t t_start = ggml_time_us();
+
+            // no conversation is overwritten unsaved: keep the slot's conversation unless the request continues it
+            if (!ret->prompt.tokens.empty() && !ret->prompt.is_continued_by(task.tokens)) {
+                ret->prompt_save(*prompt_cache);
+            }
 
             // cache prompts only for the tasks that reuse them
-            update_cache = update_cache && !task.is_stateless();
+            if (!task.is_stateless()) {
+                bool ok = ret->prompt_load(*prompt_cache, task.tokens);
 
-            if (update_cache) {
-                SRV_TRC("%s", "updating prompt cache\n");
+                // with a unified KV cache the other idle slots may hold the cells that the restore needs
+                if (!ok && params_base.kv_unified && clear_idle_slots(ret->id)) {
+                    SLT_WRN(*ret, "%s", "retrying the restore after clearing the idle slots\n");
 
-                const int64_t t_start = ggml_time_us();
-
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                    ok = ret->prompt_load(*prompt_cache, task.tokens);
                 }
 
-                prompt_cache->update();
-
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                if (!ok) {
+                    ret->prompt_clear();
+                }
             }
+
+            prompt_cache->update();
+
+            SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
         }
 
         return ret;
     }
 
+    // save the idle slots (except id_slot_keep) to the prompt cache and clear them
+    // returns true if at least one slot has been cleared
+    bool clear_idle_slots(int id_slot_keep) {
+        bool res = false;
+
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.id == id_slot_keep || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+
+            if (prompt_cache) {
+                slot.prompt_save(*prompt_cache);
+            }
+
+            slot.prompt_clear();
+
+            res = true;
+        }
+
+        return res;
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
         bool res = false;
 
@@ -1935,6 +1955,11 @@ private:
 
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+
+                // keep the conversation in the prompt cache before the cells are reused
+                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
 
                 slot.prompt_clear();
 
@@ -4366,6 +4391,9 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // from here on the slot holds the conversation of this request
+                        slot.prompt.n_protected = slot.task->n_tokens_protected();
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {

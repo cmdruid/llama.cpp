@@ -1781,12 +1781,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    // remove any cached prompts that are fully contained in the current prompt
+    // remove any cached prompts that the current prompt continues - their conversation is contained in it
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+        if (it->prompt.is_continued_by(prompt.tokens)) {
+            SRV_TRC(" - removing obsolete cached prompt with length %d\n", it->prompt.n_tokens());
 
             it = states.erase(it);
         } else {
@@ -1827,6 +1825,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.n_protected =*/ prompt.n_protected,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1837,44 +1836,79 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+int32_t server_prompt_cache::n_usable(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const {
+    if (prompt.tokens.empty() || tokens_new.empty()) {
+        return 0;
+    }
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    // mirrors the reuse of the cached tokens when the prompt is processed, see update_slots()
+    int32_t n_past = prompt.tokens.get_common_prefix(tokens_new);
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    if (n_past > 0) {
+        const llama_pos pos_next = prompt.tokens.pos_next(n_past);
+        const llama_pos pos_eval = pos_next - (n_past < (int32_t) tokens_new.size() ? 0 : 1);
+        const llama_pos pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
 
-    auto it_best = states.end();
+        if (pos_min >= pos_min_thold) {
+            // the state cannot be truncated at the divergence point - the last usable checkpoint
+            n_past = 0;
 
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-            lcp_best    = lcp_cur;
-
-            it_best = it;
+            for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
+                const auto & cur = **it;
+                if (cur.pos_max > pos_next) {
+                    continue;
+                }
+                if (cur.pos_min < pos_min_thold || cur.pos_min == 0) {
+                    const llama_pos pos_ckpt = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
+                    n_past = std::min<int64_t>(prompt.tokens.size_up_to_pos(pos_ckpt), cur.n_tokens);
+                    break;
+                }
+            }
         }
     }
 
+    // at least one token of the request is evaluated [TAG_PROMPT_LOGITS]
+    if (n_past > 0 && n_past == (int32_t) tokens_new.size()) {
+        n_past--;
+    }
+
+    return n_past;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    // what the slot already offers to the request
+    int32_t n_best = n_usable(prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new);
+
+    SRV_TRC(" - looking for better prompt, slot keeps %d of %zu tokens\n", n_best, tokens_new.size());
+
+    auto it_best = states.end();
+
+    // an entry is a candidate only if the request continues it up to a usable restore point (see n_usable)
+    // the entry that keeps the most tokens wins, the most recent one on a tie
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const int32_t n_cur = n_usable(it->prompt, it->pos_min, tokens_new);
+
+        SRV_TRC("   - prompt with length %7d, usable = %7d, continued = %d\n", it->prompt.n_tokens(), n_cur, it->prompt.is_continued_by(tokens_new));
+
+        if (n_cur == 0 || n_cur < n_best || (n_cur == n_best && it_best == states.end())) {
+            continue;
+        }
+
+        // restoring a large state to reuse a small part of it costs more than it saves,
+        // unless the request continues that conversation
+        if (8*n_cur < it->prompt.n_tokens() && !it->prompt.is_continued_by(tokens_new)) {
+            continue;
+        }
+
+        n_best  = n_cur;
+        it_best = it;
+    }
+
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        SRV_TRC(" - found better prompt with length %d, usable = %d\n", it_best->prompt.n_tokens(), n_best);
 
         {
-            auto & data = it_best->data.main;
+            const auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -1883,13 +1917,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = it_best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -1901,22 +1932,30 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
 
         // the whole cached prompt is a prefix of the new one
-        if (lcp_best == (int) it_best->prompt.tokens.size()) {
+        if (it_best->prompt.tokens.get_common_prefix(tokens_new) == it_best->prompt.tokens.size()) {
             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
         }
 
-        prompt = std::move(it_best->prompt);
+        if (it_best->prompt.is_continued_by(tokens_new)) {
+            // the slot continues this conversation and will be saved again before it is truncated, so the entry is not needed
+            prompt = std::move(it_best->prompt);
 
-        states.erase(it_best);
+            states.erase(it_best);
+        } else {
+            // the request branches off this conversation: keep the entry, the slot gets a copy
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_KEEP__\n");
+
+            prompt = it_best->prompt.clone();
+
+            // most recently used
+            states.splice(states.end(), states, it_best);
+        }
     }
 
     return true;
