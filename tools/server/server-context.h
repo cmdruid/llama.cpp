@@ -78,6 +78,10 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // after start_loop() returned: save the slots to the prompt cache and wait for the disk cache writer,
+    // within --cache-persist-timeout
+    void shutdown_persist();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
@@ -117,6 +121,8 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    server_http_context::handler_t get_cache;
+    server_http_context::handler_t post_cache_persist;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

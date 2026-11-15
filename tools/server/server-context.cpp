@@ -1022,6 +1022,36 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
     return true;
 }
 
+static json server_cache_disk_status(const server_cache_disk * cache_disk) {
+    if (!cache_disk) {
+        return nullptr;
+    }
+
+    const auto st = cache_disk->stats();
+    return json {
+        {"dir",             cache_disk->dir()},
+        {"entries",         st.n_entries},
+        {"bytes",           st.n_bytes},
+        {"limit_bytes",     st.n_bytes_max},
+        {"backlog_entries", st.n_backlog},
+        {"backlog_bytes",   st.n_backlog_bytes},
+        {"loading",         st.n_loading},
+        {"writes",          st.n_writes},
+        {"writes_skipped",  st.n_write_skipped},
+        {"write_errors",    st.n_write_errors},
+        {"reads",           st.n_reads},
+        {"read_errors",     st.n_read_errors},
+        {"removed_corrupt",    st.n_removed_corrupt},
+        {"removed_evicted",    st.n_removed_evicted},
+        {"removed_superseded", st.n_removed_superseded},
+        {"bytes_written",   st.n_bytes_written},
+        {"bytes_read",      st.n_bytes_read},
+        {"write_ms",        st.t_write_ms},
+        {"read_ms",         st.t_read_ms},
+        {"last_error",      st.last_error},
+    };
+}
+
 //
 // server_context_impl (private implementation)
 //
@@ -1050,6 +1080,11 @@ public:
 
     bool has_cap_chat() const {
         return mtmd_cap.chat;
+    }
+
+    // the disk tier of the prompt cache, nullptr if disabled; set by the first load_model(), its methods are thread-safe
+    server_cache_disk * get_cache_disk() const {
+        return cache_disk.get();
     }
 
     server_decision_context decision;
@@ -1130,6 +1165,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    uint64_t cache_persist_count = 0;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1175,6 +1212,12 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+
+            // sleeping discards the slots and the RAM cache, keep their conversations on disk
+            if (cache_disk) {
+                cache_persist_and_flush("sleep");
+            }
+
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1954,6 +1997,8 @@ private:
 
             prompt_cache->update();
 
+            cache_update_metrics();
+
             SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
         }
 
@@ -2193,6 +2238,158 @@ private:
         }
 
         cache_disk->set_live(std::move(live));
+    }
+
+    // copy the prompt cache counters into the metrics, so that /metrics can read them without the server loop
+    void cache_update_metrics() {
+        auto & m = metrics.cache;
+        if (prompt_cache) {
+            m.n_saves       = prompt_cache->stats.n_saves;
+            m.n_hits_ram    = prompt_cache->stats.n_hits_ram;
+            m.n_hits_disk   = prompt_cache->stats.n_hits_disk;
+            m.n_misses      = prompt_cache->stats.n_misses;
+            m.n_evictions   = prompt_cache->stats.n_evictions;
+            m.n_entries_ram = prompt_cache->states.size();
+            m.n_bytes_ram   = prompt_cache->size();
+        }
+    }
+
+    struct cache_persist_result {
+        int      n_saved  = 0; // slots saved to the cache
+        int      n_cached = 0; // slots whose conversation was already in the cache
+        int      n_failed = 0; // slots that could not be saved (e.g. larger than --cache-ram)
+        int      n_busy   = 0; // slots that were processing a task, saved as they stand between two decoding steps
+        size_t   n_bytes  = 0;
+        double   t_ms     = 0.0;
+        uint64_t ticket   = 0; // the disk writes to wait for
+    };
+
+    // save the conversation of every non-empty slot to the prompt cache, which writes it to disk
+    // a slot that is processing a task is saved as it stands: between two decoding steps its tokens and its state agree
+    cache_persist_result cache_persist() {
+        cache_persist_result res;
+
+        if (!prompt_cache || ctx_tgt == nullptr) {
+            return res;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        for (auto & slot : slots) {
+            if (slot.prompt.tokens.empty()) {
+                continue;
+            }
+
+            if (slot.is_processing()) {
+                res.n_busy++;
+            }
+
+            if (slot.prompt_save(*prompt_cache)) {
+                res.n_saved++;
+                res.n_bytes += prompt_cache->states.back().size();
+                continue;
+            }
+
+            const bool cached = std::any_of(prompt_cache->states.begin(), prompt_cache->states.end(), [&](const server_prompt_cache_state & state) {
+                return state.prompt.tokens.get_common_prefix(slot.prompt.tokens) == slot.prompt.tokens.size();
+            });
+            if (cached) {
+                res.n_cached++;
+            } else {
+                res.n_failed++;
+            }
+        }
+
+        prompt_cache->update();
+
+        cache_update_metrics();
+        cache_disk_update_live();
+
+        res.ticket = cache_disk ? cache_disk->ticket() : 0;
+        res.t_ms   = (ggml_time_us() - t_start) / 1000.0;
+
+        cache_persist_count++;
+
+        SRV_INF("persist: %d slots saved (%.3f MiB), %d already cached, %d failed, %d busy, %.2f ms\n",
+                res.n_saved, res.n_bytes / (1024.0 * 1024.0), res.n_cached, res.n_failed, res.n_busy, res.t_ms);
+
+        return res;
+    }
+
+    // persist and wait for the disk writer, within --cache-persist-timeout
+    void cache_persist_and_flush(const char * reason) {
+        if (!prompt_cache) {
+            return;
+        }
+
+        const int64_t t_start    = ggml_time_ms();
+        const int64_t timeout_ms = (int64_t) params_base.cache_persist_timeout*1000;
+
+        const auto res = cache_persist();
+
+        bool flushed = true;
+        if (cache_disk) {
+            flushed = cache_disk->wait(res.ticket, timeout_ms - (ggml_time_ms() - t_start));
+        }
+
+        SRV_INF("persist before %s: %d slots saved, %s in %" PRId64 " ms\n", reason, res.n_saved,
+                cache_disk ? (flushed ? "written to disk" : "NOT all written to disk (timeout)") : "no disk cache", ggml_time_ms() - t_start);
+    }
+
+    json cache_status() const {
+        json slots_data = json::array();
+        for (const auto & slot : slots) {
+            slots_data.push_back({
+                {"id",          slot.id},
+                {"n_tokens",    slot.prompt.n_tokens()},
+                {"n_protected", slot.prompt.n_tokens_protected()},
+                {"processing",  slot.is_processing()},
+            });
+        }
+
+        json ram = nullptr;
+        json counters = nullptr;
+        if (prompt_cache) {
+            ram = {
+                {"entries",     prompt_cache->states.size()},
+                {"bytes",       prompt_cache->size()},
+                {"tokens",      prompt_cache->n_tokens()},
+                {"limit_bytes", prompt_cache->limit_size},
+            };
+            const auto & st = prompt_cache->stats;
+            counters = {
+                {"saves",           st.n_saves},
+                {"hits_ram",        st.n_hits_ram},
+                {"hits_disk",       st.n_hits_disk},
+                {"misses",          st.n_misses},
+                {"evictions_ram",   st.n_evictions},
+                {"failed_restores", st.n_failed},
+                {"save_ms",         st.t_save_ms},
+                {"load_ms",         st.t_load_ms},
+                {"persists",        cache_persist_count},
+            };
+        }
+
+        return json {
+            {"ram",      ram},
+            {"disk",     server_cache_disk_status(cache_disk.get())},
+            {"counters", counters},
+            {"slots",    slots_data},
+        };
+    }
+
+    // called once the server loop has stopped, before the contexts are destroyed
+    void shutdown_persist() {
+        const int64_t t_start = ggml_time_ms();
+
+        // when sleeping, the slots were persisted before the contexts were destroyed
+        if (cache_disk && !sleeping) {
+            cache_persist_and_flush("shutdown");
+        }
+
+        if (cache_disk) {
+            cache_disk->stop((int64_t) params_base.cache_persist_timeout*1000 - (ggml_time_ms() - t_start));
+        }
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -3369,10 +3566,36 @@ private:
                     }
 
                     cache_disk_update_live();
+                    cache_update_metrics();
                 } break;
             case SERVER_TASK_TYPE_CACHE_LOADED:
                 {
                     cache_disk_loaded();
+                    cache_update_metrics();
+                } break;
+            case SERVER_TASK_TYPE_CACHE_STATUS:
+                {
+                    auto res = std::make_unique<server_task_result_cache>();
+                    res->id   = task.id;
+                    res->data = cache_status();
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CACHE_PERSIST:
+                {
+                    const auto pr = cache_persist();
+
+                    auto res = std::make_unique<server_task_result_cache>();
+                    res->id     = task.id;
+                    res->ticket = pr.ticket;
+                    res->data   = {
+                        {"n_saved",   pr.n_saved},
+                        {"n_cached",  pr.n_cached},
+                        {"n_failed",  pr.n_failed},
+                        {"n_busy",    pr.n_busy},
+                        {"n_bytes",   pr.n_bytes},
+                        {"save_ms",   pr.t_ms},
+                    };
+                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
@@ -3471,6 +3694,19 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+
+                    // thread-safe, this task may run while the loop decodes
+                    if (cache_disk) {
+                        const auto st = cache_disk->stats();
+                        auto & m = res->metrics.cache;
+                        m.disk             = true;
+                        m.n_entries_disk   = st.n_entries;
+                        m.n_bytes_disk     = st.n_bytes;
+                        m.n_backlog_bytes  = st.n_backlog_bytes;
+                        m.n_disk_writes    = st.n_writes;
+                        m.n_disk_errors    = st.n_write_errors + st.n_read_errors;
+                        m.n_disk_evictions = st.n_removed_evicted;
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -5508,6 +5744,10 @@ void server_context::start_loop() {
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 
+void server_context::shutdown_persist() {
+    impl->shutdown_persist();
+}
+
 void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
@@ -6172,6 +6412,100 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->get_cache = [this](const server_http_req & req) {
+        auto res = create_response(true);
+
+        // the RAM cache and the slots are gone while sleeping, the disk tier is not
+        if (queue_tasks.is_sleeping()) {
+            res->ok({
+                {"ram",      nullptr},
+                {"disk",     server_cache_disk_status(ctx_server.get_cache_disk())},
+                {"counters", nullptr},
+                {"slots",    json::array()},
+                {"sleeping", true},
+            });
+            return res;
+        }
+
+        {
+            server_task task(SERVER_TASK_TYPE_CACHE_STATUS);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = res->rd.next([&]{
+            return req.should_stop() || queue_tasks.is_sleeping();
+        });
+        if (!result) {
+            if (!req.should_stop()) {
+                res->error(format_error_response("the server went to sleep, retry", ERROR_TYPE_UNAVAILABLE));
+            }
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_cache_persist = [this](const server_http_req & req) {
+        auto res = create_response(true);
+
+        const int64_t t_start = ggml_time_ms();
+
+        json data = {
+            {"n_saved", 0}, {"n_cached", 0}, {"n_failed", 0}, {"n_busy", 0}, {"n_bytes", 0}, {"save_ms", 0.0},
+        };
+        uint64_t ticket = 0;
+
+        // sleeping: the slots were persisted when the server went to sleep
+        if (!queue_tasks.is_sleeping()) {
+            {
+                server_task task(SERVER_TASK_TYPE_CACHE_PERSIST);
+                task.id = res->rd.get_new_id();
+                res->rd.post_task(std::move(task), true); // high-priority task
+            }
+
+            auto result = res->rd.next([&]{
+                return req.should_stop() || queue_tasks.is_sleeping();
+            });
+            if (!result) {
+                if (!req.should_stop()) {
+                    res->error(format_error_response("the server went to sleep, retry", ERROR_TYPE_UNAVAILABLE));
+                }
+                return res;
+            }
+
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+
+            auto * res_task = dynamic_cast<server_task_result_cache *>(result.get());
+            GGML_ASSERT(res_task != nullptr);
+
+            data   = res_task->data;
+            ticket = res_task->ticket;
+        }
+
+        // wait for the writer here, not in the server loop
+        bool flushed = true;
+        if (auto * disk = ctx_server.get_cache_disk()) {
+            flushed = disk->wait(ticket, (int64_t) params.cache_persist_timeout*1000);
+        }
+
+        data["disk"]     = ctx_server.get_cache_disk() != nullptr;
+        data["flushed"]  = flushed;
+        data["total_ms"] = ggml_time_ms() - t_start;
+
+        res->ok(data);
         return res;
     };
 

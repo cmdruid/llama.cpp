@@ -1719,6 +1719,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DIR_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-persist-timeout"}, "N",
+        string_format("seconds to wait for the slots to be written to --cache-dir at shutdown, before sleeping and on POST /cache/persist (default: %d)", params.cache_persist_timeout),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-persist-timeout must be non-negative");
+            }
+            params.cache_persist_timeout = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PERSIST_TIMEOUT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

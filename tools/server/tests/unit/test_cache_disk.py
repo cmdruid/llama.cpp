@@ -21,6 +21,15 @@ class LogReader:
             content = f.read()
             self.pos = f.tell()
         return content
+    # the server logs from a thread of its own: a line may lag behind the response
+    def wait_for(self, text, timeout=5.0):
+        content = ""
+        t0 = time.time()
+        while text not in content and time.time() - t0 < timeout:
+            content += self.drain()
+            if text not in content:
+                time.sleep(0.05)
+        return content
 
 
 @pytest.fixture(autouse=True)
@@ -104,7 +113,7 @@ def test_entry_survives_restart():
     log = LogReader(server.log_path)
 
     body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
-    out = log.drain()
+    out = log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in out
     assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" in out
     assert body["timings"]["cache_n"] >= n_long
@@ -129,7 +138,7 @@ def test_conversations_beyond_ram_limit():
     # the oldest ones were dropped from RAM, they are read from disk
     for i in range(2):
         body = complete(prompts[i] + " The end.")
-        assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.drain()
+        assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
         assert body["timings"]["cache_n"] >= n[i] - 1
 
 
@@ -153,7 +162,7 @@ def test_bound_evicts_oldest_keeps_live():
     wait_entries(2)
     time.sleep(0.5)
 
-    out = log.drain()
+    out = log.wait_for("evicting entry")
     assert "evicting entry" in out
     assert len(entry_files()) <= 2
 
@@ -162,7 +171,7 @@ def test_bound_evicts_oldest_keeps_live():
 
     # the live conversation was the oldest entry, it is still there
     body = complete(live + " The end.")
-    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.drain()
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
     assert body["timings"]["cache_n"] > n_tokens(live) // 2
 
     # the oldest of the others is gone
@@ -180,7 +189,8 @@ def test_damaged_entry_is_removed(damage):
     wait_entries(1)
     server.stop()
 
-    path = entry_files()[0]
+    # the shutdown persisted the slot as well: the long conversation is the largest entry
+    path = max(entry_files(), key=os.path.getsize)
     size = os.path.getsize(path)
     if damage == "truncate":
         with open(path, "r+b") as f:
@@ -197,13 +207,11 @@ def test_damaged_entry_is_removed(damage):
     log = LogReader(server.log_path)
 
     body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
-    out = log.drain()
+    expected = "removing invalid or truncated entry" if damage == "truncate" else "is corrupt, removing it"
+    out = log.wait_for(expected)
+    assert expected in out
     assert "__TEST_TAG_PROMPT_CACHE_RESTORE__" not in out
     assert body["timings"]["cache_n"] == 0
-    if damage == "truncate":
-        assert "removing invalid or truncated entry" in out
-    else:
-        assert "is corrupt, removing it" in out
     assert path not in entry_files()
 
 
@@ -249,12 +257,146 @@ def test_kv_unified_idle_slot_reaches_disk():
     n_long = n_tokens(LONG_PROMPT)
     complete(LONG_PROMPT, id_slot=0)
     complete(OTHER_PROMPT, id_slot=1)
-    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.wait_for("__TEST_TAG_CACHE_IDLE_SLOT__")
     wait_entries(1)
 
     restart()
     log = LogReader(server.log_path)
 
     body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
-    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.drain()
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
     assert body["timings"]["cache_n"] >= n_long
+
+
+def kill():
+    # no graceful shutdown: only what is already on disk survives
+    server.process.kill()
+    server.process.wait()
+    server.process = None
+    server_instances.discard(server)
+    os.replace(server.log_path, server.log_path + ".prev")
+
+
+# POST /cache/persist writes the live slots and waits for the writer: the conversation survives a crash
+def test_persist_endpoint():
+    global server
+    server.start()
+
+    n_long = n_tokens(LONG_PROMPT)
+    complete(LONG_PROMPT)
+    assert entry_files() == []
+
+    res = server.make_request("POST", "/cache/persist")
+    assert res.status_code == 200
+    assert res.body["n_saved"] == 1
+    assert res.body["n_busy"] == 0
+    assert res.body["disk"] is True
+    assert res.body["flushed"] is True
+    assert len(entry_files()) == 1
+
+    # nothing new to save
+    res = server.make_request("POST", "/cache/persist")
+    assert res.status_code == 200
+    assert res.body["n_saved"] == 0
+    assert res.body["n_cached"] == 1
+    assert len(entry_files()) == 1
+
+    res = server.make_request("GET", "/cache")
+    assert res.status_code == 200
+    assert res.body["disk"]["entries"] == 1
+    assert res.body["disk"]["backlog_entries"] == 0
+    assert res.body["counters"]["persists"] == 2
+    assert res.body["slots"][0]["n_tokens"] > 0
+
+    kill()
+    server.start()
+    log = LogReader(server.log_path)
+
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
+    assert body["timings"]["cache_n"] >= n_long
+
+    res = server.make_request("GET", "/cache")
+    assert res.body["counters"]["hits_disk"] == 1
+    assert res.body["counters"]["hits_ram"] == 1
+
+
+# a graceful shutdown (SIGTERM) persists the live slots
+def test_sigterm_persists_live_slot():
+    global server
+    server.start()
+
+    n_long = n_tokens(LONG_PROMPT)
+    complete(LONG_PROMPT)
+    assert entry_files() == []
+
+    restart() # SIGTERM
+    assert "persist before shutdown: 1 slots saved, written to disk" in open(server.log_path + ".prev", errors="replace").read()
+    assert len(entry_files()) == 1
+
+    log = LogReader(server.log_path)
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
+    assert body["timings"]["cache_n"] >= n_long
+
+
+# going to sleep discards the slots and the RAM cache: their conversations are persisted first
+def test_sleep_persists():
+    global server
+    server.sleep_idle_seconds = 1
+    server.start()
+    log = LogReader(server.log_path)
+
+    n_long = n_tokens(LONG_PROMPT)
+    complete(LONG_PROMPT)
+
+    t0 = time.time()
+    while "persist before sleep" not in log.drain():
+        assert time.time() - t0 < 10
+        time.sleep(0.1)
+    assert len(entry_files()) == 1
+
+    res = server.make_request("GET", "/cache")
+    assert res.status_code == 200
+    assert res.body["sleeping"] is True
+    assert res.body["disk"]["entries"] == 1
+
+    body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
+    assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
+    assert body["timings"]["cache_n"] >= n_long
+
+
+def test_metrics():
+    global server
+    server.server_metrics = True
+    server.start()
+
+    complete(LONG_PROMPT)
+    complete(OTHER_PROMPT)
+    wait_entries(1)
+
+    res = server.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    metrics = {}
+    for line in res.body.splitlines():
+        if line.startswith("llamacpp:prompt_cache"):
+            k, v = line.split(" ")
+            metrics[k] = float(v)
+    assert metrics["llamacpp:prompt_cache_saves_total"] >= 1
+    assert metrics["llamacpp:prompt_cache_disk_entries"] == 1
+    assert metrics["llamacpp:prompt_cache_disk_bytes"] > 0
+    assert metrics["llamacpp:prompt_cache_disk_writes_total"] == 1
+
+
+def test_disabled_without_cache_ram():
+    global server
+    server.cache_ram = 0
+    server.start()
+    log = LogReader(server.log_path)
+    assert "--cache-dir requires --cache-ram" in log.wait_for("--cache-dir requires --cache-ram")
+
+    complete(LONG_PROMPT)
+    res = server.make_request("POST", "/cache/persist")
+    assert res.status_code == 200
+    assert res.body["disk"] is False
+    assert entry_files() == []

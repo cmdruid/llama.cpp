@@ -1637,6 +1637,26 @@ std::string server_task_result_metrics::to_metrics() {
         },
     };
 
+    std::vector<metric_item> cache_counters = {
+        { "prompt_cache_saves_total",     "Prompt cache: entries saved from a slot",                  (double) metrics.cache.n_saves },
+        { "prompt_cache_hits_ram_total",  "Prompt cache: entries restored into a slot",               (double) metrics.cache.n_hits_ram },
+        { "prompt_cache_hits_disk_total", "Prompt cache: entries read from disk for a request",       (double) metrics.cache.n_hits_disk },
+        { "prompt_cache_misses_total",    "Prompt cache: requests with nothing to reuse",             (double) metrics.cache.n_misses },
+        { "prompt_cache_evictions_total", "Prompt cache: entries dropped from RAM to fit the limits",  (double) metrics.cache.n_evictions },
+    };
+    std::vector<metric_item> cache_gauges = {
+        { "prompt_cache_ram_entries", "Prompt cache: entries in RAM",         (double) metrics.cache.n_entries_ram },
+        { "prompt_cache_ram_bytes",   "Prompt cache: size of the RAM tier",   (double) metrics.cache.n_bytes_ram },
+    };
+    if (metrics.cache.disk) {
+        cache_counters.push_back({ "prompt_cache_disk_writes_total",    "Prompt cache: entries written to disk",          (double) metrics.cache.n_disk_writes });
+        cache_counters.push_back({ "prompt_cache_disk_errors_total",    "Prompt cache: failed disk writes and reads",     (double) metrics.cache.n_disk_errors });
+        cache_counters.push_back({ "prompt_cache_disk_evictions_total", "Prompt cache: entries removed to fit the bound", (double) metrics.cache.n_disk_evictions });
+        cache_gauges.push_back({ "prompt_cache_disk_entries",       "Prompt cache: entries on disk",                (double) metrics.cache.n_entries_disk });
+        cache_gauges.push_back({ "prompt_cache_disk_bytes",         "Prompt cache: size of the disk tier",          (double) metrics.cache.n_bytes_disk });
+        cache_gauges.push_back({ "prompt_cache_disk_backlog_bytes", "Prompt cache: bytes waiting to be written",    (double) metrics.cache.n_backlog_bytes });
+    }
+
     std::stringstream prometheus;
 
     auto add_items = [&prometheus](const char * type, const std::vector<metric_item> & items) {
@@ -1649,6 +1669,8 @@ std::string server_task_result_metrics::to_metrics() {
 
     add_items("counter", counters);
     add_items("gauge",   gauges);
+    add_items("counter", cache_counters);
+    add_items("gauge",   cache_gauges);
 
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
