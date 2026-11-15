@@ -478,7 +478,6 @@ struct server_cache_disk::state {
     uint64_t                      n_progress = 0;     // writes the writer finished (written or failed)
     bool                          stalled    = false; // release() timed out waiting for the writer ...
     uint64_t                      stalled_at = 0;     // ... when n_progress was this
-    bool                          wait_allowed = true; // see set_wait_allowed()
     bool                          stopping   = false;
     bool                          writer_exited = false;
     bool                          reader_exited = false;
@@ -1944,11 +1943,6 @@ void server_cache_disk::write_ahead(const std::vector<uint64_t> & ids) {
     }
 }
 
-void server_cache_disk::set_wait_allowed(bool allowed) {
-    std::unique_lock<std::mutex> lock(st->mtx);
-    st->wait_allowed = allowed;
-}
-
 void server_cache_disk::release(const server_prompt_cache_state & state) {
     llama_tokens tokens;
     uint64_t id = 0;
@@ -1986,14 +1980,6 @@ void server_cache_disk::release(const server_prompt_cache_state & state) {
     };
 
     if (needed && n_released() > 0 && !st->stopping) {
-        // the server loop must not wait (going to sleep, the task queue is locked)
-        if (!st->wait_allowed) {
-            DSK_WRN("the disk writer is busy and the server may not wait, dropping entry %s instead of holding its memory\n", hex64(id).c_str());
-            drop_entry();
-            st->st.n_write_dropped_nowait++;
-            return;
-        }
-
         // a wait timed out and the writer has not finished a write since: it is stuck (a hung disk), waiting again
         // would only freeze the server loop once more
         if (st->stalled && st->n_progress == st->stalled_at) {

@@ -23,8 +23,8 @@
 // write-behind: --cache-dir-delay is the maximum age of a conversation's unwritten progress: an entry saved to the RAM
 // cache is written once its oldest progress not on disk is --cache-dir-delay seconds old, when the RAM cache drops it
 // to stay within its limits (the writer then holds its memory until it is written), when it is one of the next
-// entries the RAM cache will drop (write-ahead, see write_ahead()), or when a flush asks for everything (persist,
-// shutdown, sleep); an entry that leaves the RAM cache before then because a slot continues it is not written, the
+// entries the RAM cache will drop (write-ahead, see write_ahead()), or when a flush asks for everything (the
+// shutdown); an entry that leaves the RAM cache before then because a slot continues it is not written, the
 // slot inherits the age of its progress (see drop()) and its next save supersedes it
 //
 // - <key> names everything that shapes a saved state (model and draft files, context and KV settings), so a state is
@@ -81,7 +81,6 @@ struct server_cache_disk_stats {
     uint64_t n_write_errors  = 0;
     uint64_t n_write_dropped = 0; // dropped by the RAM cache while the writer did not keep up (all causes)
     uint64_t n_write_dropped_stalled = 0; // of which without waiting: the writer made no progress since a timeout
-    uint64_t n_write_dropped_nowait  = 0; // of which without waiting: the server loop may not wait (going to sleep)
     uint64_t n_write_ahead   = 0; // writes started before the delay because the RAM cache was about to drop the entry
     uint64_t n_touches       = 0; // file mtime updates (LRU order across restarts), coalesced per entry
     uint64_t n_reads         = 0;
@@ -148,15 +147,11 @@ struct server_cache_disk {
     // them now, regardless of their delay, so that release() finds them on disk
     void write_ahead(const std::vector<uint64_t> & ids);
 
-    // false: release() never waits for the writer, it drops the entry instead (the server loop holds a lock that
-    // must not wait for the disk, e.g. going to sleep)
-    void set_wait_allowed(bool allowed);
-
     // the RAM cache drops the entry to stay within its limits: write it now, unless it is already on disk
     // the writer then holds its memory: if it holds another such entry already, this waits until that one is written
     // (at most t_wait_max_ms, then the entry is dropped), so that the memory beyond --cache-ram stays within one entry;
     // after such a timeout, entries are dropped without waiting until the writer finishes a write (a hung disk freezes
-    // the server loop once), and never waits while set_wait_allowed(false)
+    // the server loop once)
     void release(const server_prompt_cache_state & state);
 
     // write every entry not written yet, the most recently saved first; returns the ticket for wait()

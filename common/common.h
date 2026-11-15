@@ -666,7 +666,7 @@ struct common_params {
     std::string cache_dir;                   // disk tier of the prompt cache, empty = disabled
     int32_t cache_dir_max_mib   = 32768; // size limit of the disk tier in MiB
     int32_t cache_dir_delay     = 60;    // maximum age in seconds of a conversation's progress not written to the disk tier
-    int32_t cache_persist_timeout = 30;  // seconds to persist the slots to the disk tier at shutdown and before sleep
+    int32_t cache_persist_timeout = 30;  // seconds to persist the slots to the disk tier at shutdown (and the longest wait for a lagging disk writer)
 
     // llama-connect params
     bool        server_connect      = false;

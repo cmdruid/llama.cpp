@@ -172,7 +172,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--cache-dir PATH` | directory of the disk tier of the prompt cache: cache entries are written there and reused after a restart<br/>entries live in a subdirectory per model and context configuration; requires --cache-ram (default: disabled)<br/>(env: LLAMA_ARG_CACHE_DIR) |
 | `--cache-dir-max N` | size limit of --cache-dir in MiB, all keys together; least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
 | `--cache-dir-delay N` | maximum age in seconds of a conversation's progress not yet written to --cache-dir: a prompt cache entry is<br/>written once its oldest unwritten progress is this old, an idle slot is saved and written then too; an entry<br/>that a request continues before then is not written, one that the RAM cache drops is written first (default: 60, 0 = at once)<br/>(env: LLAMA_ARG_CACHE_DIR_DELAY) |
-| `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, and before sleeping (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
+| `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, and the longest wait for a lagging disk writer (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
@@ -1331,7 +1331,7 @@ updates), `writes_no_room` the entries for which the bound left no room and `wri
 their delay because the RAM cache was about to drop them. `backlog_waits`/`backlog_wait_ms` count the times the server
 loop waited for the writer, `backlog_timeouts` the waits that ran out (the writer is then taken as stalled),
 `writes_dropped` the entries dropped instead of written, of which `writes_dropped_stalled` without waiting for a stalled
-writer and `writes_dropped_nowait` while going to sleep. `bytes` counts every file under `DIR`,
+writer. `bytes` counts every file under `DIR`,
 `other_entries`/`other_bytes` the part of it that belongs to other keys.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
@@ -2710,12 +2710,14 @@ not written when it is saved to RAM, but when one of these happens first:
   (`backlog_waits`, `backlog_wait_ms`, `released_entries`/`released_bytes` in `GET /cache`); if the writer does not
   keep up within `--cache-persist-timeout`, the entry is dropped instead (`writes_dropped`, `backlog_timeouts`), and
   until the writer finishes a write the next such entries are dropped without waiting (`writes_dropped_stalled`), so a
-  hung disk stops the server loop once, not at every eviction. Going to sleep never waits: such an entry is dropped
-  (`writes_dropped_nowait`). With write-ahead these waits and drops are rare: they need entries dropped from RAM
+  hung disk stops the server loop once, not at every eviction. With write-ahead these waits and drops are rare: they need entries dropped from RAM
   faster than the writer writes them;
-- a graceful shutdown (SIGTERM) or going to sleep: everything not written yet is written, the most
-  recently saved first (after the entries the RAM cache dropped or is about to drop), within `--cache-persist-timeout`
-  (going to sleep does not wait for it).
+- a graceful shutdown (SIGTERM): the slots are saved and everything not written yet is written, the most recently
+  saved first (after the entries the RAM cache dropped or is about to drop), within `--cache-persist-timeout`.
+
+Going to sleep (`--sleep-idle-seconds`) discards the slots and the RAM cache without saving them: what is not on disk
+or staged for the writer by then is lost, as on a crash; the writer finishes the entries it holds while the server
+sleeps.
 
 The cost of the delay: a conversation in constant use is written about once per `--cache-dir-delay`, the whole entry
 each time. With the default of 60 s and entries of 2–6 GiB that is up to 6 GiB per minute per active conversation

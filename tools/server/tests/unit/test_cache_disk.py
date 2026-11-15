@@ -316,8 +316,9 @@ def test_sigterm_persists_live_slot():
     assert body["timings"]["cache_n"] >= n_long
 
 
-# going to sleep discards the slots and the RAM cache: their conversations are persisted first
-def test_sleep_persists():
+# going to sleep discards the slots and the RAM cache without saving them; the disk tier stays: what was written before
+# is read back after the wake-up, and GET /cache answers while the server sleeps
+def test_sleep_keeps_disk_tier():
     global server
     server.sleep_idle_seconds = 1
     server.start()
@@ -325,14 +326,10 @@ def test_sleep_persists():
 
     n_long = n_tokens(LONG_PROMPT)
     complete(LONG_PROMPT)
+    complete(OTHER_PROMPT) # LONG is written (delay 0)
+    wait_disk("writes", 1)
 
-    t0 = time.time()
-    while "persist before sleep" not in log.drain():
-        assert time.time() - t0 < 10
-        time.sleep(0.1)
-    wait_disk("writes", 1) # the file is renamed into place before the counter moves
-    assert len(entry_files()) == 1
-
+    assert "server is entering sleeping state" in log.wait_for("server is entering sleeping state", timeout=10)
     res = server.make_request("GET", "/cache")
     assert res.status_code == 200
     assert res.body["sleeping"] is True
@@ -341,6 +338,7 @@ def test_sleep_persists():
     body = complete(LONG_PROMPT + " The knight finally reached the castle gates.")
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" in log.wait_for("__TEST_TAG_PROMPT_CACHE_DISK_LOAD__")
     assert body["timings"]["cache_n"] >= n_long
+    assert len(entry_files()) == 1 # OTHER was in the slot: discarded by the sleep, not written
 
 
 def test_metrics():
@@ -967,7 +965,8 @@ def test_cancelled_waiting_task_releases_read(monkeypatch):
     assert "__TEST_TAG_PROMPT_CACHE_DISK_LOAD__" not in log.drain()
 
 
-# going to sleep does not wait for the disk writer with the task queue locked: HTTP requests are answered meanwhile
+# going to sleep does not wait for the disk writer: HTTP requests are answered meanwhile, and the writer finishes the
+# entry it holds while the server sleeps
 @needs_test_hooks
 def test_sleep_does_not_wait_for_writer(monkeypatch):
     global server
@@ -977,7 +976,8 @@ def test_sleep_does_not_wait_for_writer(monkeypatch):
     log = LogReader(server.log_path)
 
     complete(LONG_PROMPT)
-    assert "persist before sleep" in log.wait_for("persist before sleep", timeout=10)
+    complete(OTHER_PROMPT) # LONG is staged (delay 0), the writer takes 3 s
+    assert "server is entering sleeping state" in log.wait_for("server is entering sleeping state", timeout=10)
 
     t0 = time.time()
     st = cache_status()
@@ -1415,28 +1415,3 @@ def test_write_ahead_avoids_backlog_wait(monkeypatch):
     assert st["backlog_waits"] == 0, st
     assert st["writes_ahead"] >= 2, st
     assert st["writes_dropped"] == 0, st
-
-
-# going to sleep never waits for the writer with the task queue locked: an entry that would need a wait is dropped
-@needs_test_hooks
-def test_sleep_never_waits_for_writer(monkeypatch):
-    global server
-    monkeypatch.setenv(WRITE_DELAY_ENV_, "4000")
-    server.cache_dir_delay = 60
-    server.cache_ram = 1 # MiB
-    server.sleep_idle_seconds = 1
-    server.start()
-    log = LogReader(server.log_path)
-
-    for i in range(4):
-        complete(conversation(i, 4))
-    out = log.wait_for("server is entering sleeping state", timeout=10)
-    assert "server is entering sleeping state" in out
-    t0 = time.time()
-    st = cache_status()
-    assert time.time() - t0 < 1.0
-    out += log.wait_for("persist before sleep")
-    assert "persist before sleep" in out
-    st = cache_status()
-    assert st["sleeping"] is True
-    assert st["disk"]["writes_dropped_nowait"] == 1, st["disk"]

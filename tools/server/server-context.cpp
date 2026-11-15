@@ -1050,7 +1050,6 @@ static json server_cache_disk_status(const server_cache_disk * cache_disk) {
         {"backlog_timeouts", st.n_backlog_timeouts},
         {"writes_dropped",  st.n_write_dropped},
         {"writes_dropped_stalled", st.n_write_dropped_stalled},
-        {"writes_dropped_nowait",  st.n_write_dropped_nowait},
         {"writes_ahead",    st.n_write_ahead},
         {"touches",         st.n_touches},
         {"writes",          st.n_writes},
@@ -1235,19 +1234,8 @@ private:
             }
             SRV_INF("%s", "server is entering sleeping state\n");
 
-            // sleeping discards the slots and the RAM cache, keep their conversations on disk
-            // this runs with the task queue locked: the slots are saved, the writer finishes in the background (it keeps
-            // the states it writes), so that HTTP threads are not held up by the disk
-            // the RAM cache may drop entries to make room for the slots: it never waits for the writer here, it drops an
-            // entry instead when the writer still holds another dropped one (writes_dropped_nowait)
-            if (cache_disk) {
-                cache_disk->set_wait_allowed(false);
-                const auto res = cache_persist();
-                cache_disk->set_wait_allowed(true);
-                SRV_INF("persist before sleep: %d slots saved, %zu entries (%.3f MiB) are written in the background\n",
-                        res.n_saved, cache_disk->stats().n_backlog, cache_disk->stats().n_backlog_bytes / (1024.0 * 1024.0));
-            }
-
+            // sleeping discards the slots and the RAM cache; the disk tier stays open, its writer finishes the entries
+            // it holds in the background
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -2500,7 +2488,7 @@ private:
     void shutdown_persist() {
         const int64_t t_start = ggml_time_ms();
 
-        // when sleeping, the slots were persisted before the contexts were destroyed
+        // when sleeping, the contexts and the slots are gone
         if (cache_disk && !sleeping) {
             cache_persist_and_flush("shutdown");
         }
