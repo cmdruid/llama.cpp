@@ -667,6 +667,7 @@ struct common_params {
     int32_t cache_dir_max_mib   = 32768; // size limit of the disk tier in MiB
     int32_t cache_dir_delay     = 60;    // maximum age in seconds of a conversation's progress not written to the disk tier
     int32_t cache_persist_timeout = 30;  // seconds to persist the slots to the disk tier at shutdown (and the longest wait for a lagging disk writer)
+    int32_t cache_shared_prefix = 2048;  // minimum length in tokens of a shared prefix kept as a prompt cache entry of its own, 0 = none
 
     // llama-connect params
     bool        server_connect      = false;

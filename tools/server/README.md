@@ -173,6 +173,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--cache-dir-max N` | size limit of --cache-dir in MiB, all keys together; least recently used entries are removed first (default: 32768)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
 | `--cache-dir-delay N` | maximum age in seconds of a conversation's progress not yet written to --cache-dir: a prompt cache entry is<br/>written once its oldest unwritten progress is this old, an idle slot is saved and written then too; an entry<br/>that a request continues before then is not written, one that the RAM cache drops is written first (default: 60, 0 = at once)<br/>(env: LLAMA_ARG_CACHE_DIR_DELAY) |
 | `--cache-persist-timeout N` | seconds to wait for the slots to be written to --cache-dir at shutdown, and the longest wait for a lagging disk writer (default: 30)<br/>(env: LLAMA_ARG_CACHE_PERSIST_TIMEOUT) |
+| `--cache-shared-prefix N` | keep the prompt before the first user message of a chat request as a prompt cache entry of its own if it has<br/>at least N tokens, so that a new conversation that starts with it does not process it again; 0 = disabled<br/>(default: 2048, requires --cache-ram)<br/>(env: LLAMA_ARG_CACHE_SHARED_PREFIX) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
@@ -2652,6 +2653,26 @@ assistant turns after it may be rendered differently when the client sends them 
   Restoring an entry for less than an eighth of its tokens is skipped unless the request continues it.
 - An entry the request continues moves into the slot. A request that branches off a conversation (an edited earlier
   turn) gets a copy: the original stays cached, and the branch is saved as an entry of its own when it leaves the slot.
+
+**Shared prefix.** A harness starts every conversation with the same system prompt and tools. With
+`--cache-shared-prefix N` (default 2048, 0 disables it) the prompt before the first user message of a chat request is
+kept as an entry of its own when it has at least `N` tokens, so a new conversation that starts with it is warm even when
+the conversations that share it are long or gone.
+- The end of the prefix is the start of the first user message as the chat template's message delimiters mark it in
+  the tokens (the same marks that set a conversation's protected prefix). A request without them (a raw prompt, a
+  template without delimiters, no user message) or with media makes no entry.
+- No extra pass over the prompt: when a slot processes a prompt whose prefix the cache does not hold, its batch ends at
+  the prefix and the state is saved there before the rest is processed (the log says `saved the shared prefix <id>
+  (<n> tokens)`). A state that a request could not continue from its end is not saved (with a sliding window and
+  recurrent memory, unless `--swa-full`).
+- One entry per distinct prefix (its tokens' hash, as for every entry). A request uses it only if it starts with all of
+  it; no request continues it, so it is never moved into a slot or superseded by a conversation: the slot gets a copy
+  (`restored the shared prefix <id> (<n> tokens)`). An entry that keeps more tokens of the request (the request's own
+  conversation) wins; on a tie the shared prefix wins, as the smaller state.
+- It counts in `--cache-ram` and `--cache-dir-max` and is evicted like the other entries, least recently used first
+  (a restore is a use); like the entries of live conversations, it is not evicted from disk while a slot holds a
+  conversation that starts with it. It is written to disk and persisted at shutdown like the others, its file marked
+  as a shared prefix (`n_protected` -1). `GET /cache` counts it among the `memory` and `disk` entries.
 
 **Changes for `--cache-ram` alone.** The matching rules above also apply without `--cache-dir`; compared with the
 earlier prompt cache:

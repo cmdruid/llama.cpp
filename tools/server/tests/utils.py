@@ -126,6 +126,7 @@ class ServerProcess:
     cache_dir_max: int | None = None
     cache_dir_delay: int | None = None
     cache_persist_timeout: int | None = None
+    cache_shared_prefix: int | None = None
     override_kv: str | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
@@ -319,6 +320,8 @@ class ServerProcess:
             server_args.extend(["--cache-dir-delay", self.cache_dir_delay])
         if self.cache_persist_timeout is not None:
             server_args.extend(["--cache-persist-timeout", self.cache_persist_timeout])
+        if self.cache_shared_prefix is not None:
+            server_args.extend(["--cache-shared-prefix", self.cache_shared_prefix])
         if self.override_kv:
             server_args.extend(["--override-kv", self.override_kv])
         if self.no_cache_idle_slots:

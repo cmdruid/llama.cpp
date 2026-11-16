@@ -341,8 +341,24 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // the shared prefix of the task to save to the prompt cache once the slot holds just that, 0 = none
+    int32_t n_shared_save = 0;
+
     bool prompt_save(server_prompt_cache & prompt_cache) {
-        if (prompt.tokens.size() == 0) {
+        if (!state_save(prompt_cache, prompt)) {
+            return false;
+        }
+
+        // the progress is in the entry now, which is written by its deadline
+        prompt.t_unwritten_ms = 0;
+
+        return true;
+    }
+
+    // save the state of the slot to the prompt cache as the entry of `p`: the slot's prompt, or its shared prefix
+    // when the slot holds just that, see server_context_impl::shared_prefix_to_save()
+    bool state_save(server_prompt_cache & prompt_cache, const server_prompt & p) {
+        if (p.tokens.size() == 0) {
             return false;
         }
 
@@ -352,11 +368,11 @@ struct server_slot {
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+                (int) p.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
         const int64_t t_start = ggml_time_us();
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(p, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
@@ -375,9 +391,6 @@ struct server_slot {
 
         // the entry is complete: from here on its data is not modified, the disk writer may share it
         prompt_cache.on_saved(*cur);
-
-        // the progress is in the entry now, which is written by its deadline
-        prompt.t_unwritten_ms = 0;
 
         return true;
     }
@@ -2209,6 +2222,46 @@ private:
         if (!cache_disk) {
             SRV_ERR("%s", "failed to open the disk prompt cache, continuing without it\n");
         }
+    }
+
+    // the shared prefix of the slot's task to keep as a prompt cache entry of its own (--cache-shared-prefix), 0 = none:
+    // the prompt before its first user message, as the chat template's message delimiters mark it in the tokens (no
+    // marks, no entry), if it has at least --cache-shared-prefix tokens, the slot processes its end and the cache does
+    // not hold it yet; the state is taken when the slot holds just that prefix, while the prompt is processed
+    int32_t shared_prefix_to_save(const server_slot & slot) const {
+        const server_task & task = *slot.task;
+        if (!prompt_cache || params_base.cache_shared_prefix <= 0 || task.type != SERVER_TASK_TYPE_COMPLETION ||
+                task.is_child() || !task.params.cache_prompt) {
+            return 0;
+        }
+
+        int32_t n = 0;
+        for (const auto & span : task.params.message_spans.spans) {
+            if (span.role == COMMON_CHAT_ROLE_USER) {
+                n = (int32_t) span.pos;
+                break;
+            }
+        }
+        llama_tokens tokens;
+        if (n < params_base.cache_shared_prefix || n >= task.n_tokens() || slot.prompt.n_tokens() > n ||
+                !server_cache_disk_text_tokens(task.tokens, tokens)) {
+            return 0;
+        }
+        tokens.resize(n);
+
+        const uint64_t id = server_cache_disk_hash_tokens(tokens);
+        if (prompt_cache->contains(id)) {
+            return 0;
+        }
+        if (cache_disk) {
+            for (const auto & e : cache_disk->entries()) {
+                if (e->id == id) {
+                    return 0;
+                }
+            }
+        }
+
+        return n;
     }
 
     // if a disk cache entry that is not in RAM offers the request more than the RAM cache and the idle slots, read it
@@ -4974,6 +5027,8 @@ private:
                         // from here on the slot holds the conversation of this request
                         slot.prompt.n_protected = slot.task->n_tokens_protected();
 
+                        slot.n_shared_save = shared_prefix_to_save(slot);
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -5103,6 +5158,22 @@ private:
                         has_mtmd = true;
                     }
 
+                    // the previous batch ended at the shared prefix: the slot holds just that, save it as an entry of its own
+                    if (slot.n_shared_save > 0 && slot.prompt.n_tokens() == slot.n_shared_save) {
+                        if (prompt_cache) {
+                            const server_prompt shared { slot.prompt.tokens.clone(), {}, server_prompt::SHARED, 0 };
+                            const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            if (prompt_cache->n_usable(shared, pos_min, slot.task->tokens) < shared.n_tokens()) {
+                                // e.g. SWA with recurrent memory: a request could not continue the state from its end
+                                SLT_INF(slot, "the shared prefix (%d tokens) could not be restored, not saved\n", shared.n_tokens());
+                            } else if (slot.state_save(*prompt_cache, shared)) {
+                                SLT_INF(slot, "saved the shared prefix %016llx (%d tokens)\n", (unsigned long long) prompt_cache->states.back().id, shared.n_tokens());
+                                prompt_cache->update();
+                            }
+                        }
+                        slot.n_shared_save = 0;
+                    }
+
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
@@ -5118,6 +5189,11 @@ private:
 
                         // stop at the end of the shared prefix, the children are started from this state
                         if (wait_shared && slot.prompt.n_tokens() == slot.task->n_tokens_shared) {
+                            break;
+                        }
+
+                        // stop before the first user message, its state is saved before the next batch (--cache-shared-prefix)
+                        if (slot.n_shared_save > 0 && slot.prompt.n_tokens() == slot.n_shared_save) {
                             break;
                         }
 

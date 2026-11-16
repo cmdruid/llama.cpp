@@ -175,8 +175,8 @@ bool server_cache_disk_text_tokens(const server_tokens & tokens, llama_tokens & 
 // file format, version 1 (little-endian)
 //
 //   header (96 bytes):
-//     u32 magic "LSPC", u32 version, u64 key hash, u64 id (hash of the tokens), u64 n_tokens, i64 n_protected,
-//     i64 pos_min, u64 n_checkpoints, u64 size of the main state, u64 size of the draft state, u64 size of the meta
+//     u32 magic "LSPC", u32 version, u64 key hash, u64 id (hash of the tokens), u64 n_tokens, i64 n_protected
+//     (-1: a shared prefix, see server_prompt::SHARED), i64 pos_min, u64 n_checkpoints, u64 size of the main state, u64 size of the draft state, u64 size of the meta
 //     section, u64 size of the file, u64 hash of the header (without this field) and of the meta section
 //   meta:
 //     the tokens (i32 each), then per checkpoint: i64 n_tokens, i32 pos_min, i32 pos_max,

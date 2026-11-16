@@ -720,7 +720,15 @@ struct server_prompt {
 
     // the prefix that a request must share to continue this conversation, 0 = all tokens
     // see server_task::n_tokens_protected()
+    // SHARED marks a cache entry that holds a shared prefix (the prompt before the first user message, see
+    // --cache-shared-prefix): no request continues it, a request that uses it gets a copy, nothing supersedes it
     int32_t n_protected = 0;
+
+    static constexpr int32_t SHARED = -1;
+
+    bool is_shared() const {
+        return n_protected == SHARED;
+    }
 
     // the time (ggml_time_ms()) of the oldest progress of this conversation that is not on disk, 0 = none or unknown
     // set when a slot starts a task, inherited from the cache entries it continues, see server_cache_disk::drop();
@@ -745,15 +753,16 @@ struct server_prompt {
     // true if a request with these tokens continues this conversation: it keeps the whole protected prefix
     // a request that does not continue it would discard part of the conversation
     bool is_continued_by(const server_tokens & tokens_new) const {
-        return (int32_t) tokens.get_common_prefix(tokens_new) >= n_tokens_protected();
+        return !is_shared() && (int32_t) tokens.get_common_prefix(tokens_new) >= n_tokens_protected();
     }
 
     server_prompt clone() const {
         // a copy is a branch: its progress starts when it is used
+        // the copy of a shared prefix starts a conversation of its own
         return server_prompt {
             tokens.clone(),
             checkpoints,
-            n_protected,
+            is_shared() ? 0 : n_protected,
             0,
         };
     }

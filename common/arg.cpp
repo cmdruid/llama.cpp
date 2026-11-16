@@ -1741,6 +1741,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_PERSIST_TIMEOUT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-shared-prefix"}, "N",
+        string_format("keep the prompt before the first user message of a chat request as a prompt cache entry of its own if it has\n"
+                      "at least N tokens, so that a new conversation that starts with it does not process it again; 0 = disabled\n"
+                      "(default: %d, requires --cache-ram)", params.cache_shared_prefix),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-shared-prefix must be non-negative");
+            }
+            params.cache_shared_prefix = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SHARED_PREFIX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

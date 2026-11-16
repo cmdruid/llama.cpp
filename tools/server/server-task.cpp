@@ -1758,10 +1758,11 @@ size_t server_prompt_cache::n_tokens() const {
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
+    // a shared prefix is kept even if conversations contain it: they do not offer its state without a restore point there
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cur_lcp_len == (int) prompt.tokens.size() && (!prompt.is_shared() || it->prompt.n_tokens() == cur_lcp_len)) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1894,6 +1895,11 @@ int32_t server_prompt_cache::n_usable(const server_prompt & prompt, llama_pos po
 }
 
 int32_t server_prompt_cache::n_candidate(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const {
+    // a shared prefix is used only by a request that starts with all of it
+    if (prompt.is_shared() && (int32_t) prompt.tokens.get_common_prefix(tokens_new) < prompt.n_tokens()) {
+        return 0;
+    }
+
     const int32_t n_cur = n_usable(prompt, pos_min, tokens_new);
 
     if (8*n_cur < prompt.n_tokens() && !prompt.is_continued_by(tokens_new)) {
@@ -1912,13 +1918,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     auto it_best = states.end();
 
     // an entry is a candidate only if the request continues it up to a usable restore point (see n_usable)
-    // the entry that keeps the most tokens wins, the most recent one on a tie
+    // the entry that keeps the most tokens wins, on a tie a shared prefix (the smallest state), then the most recent one
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int32_t n_cur = n_candidate(it->prompt, it->pos_min, tokens_new);
 
         SRV_TRC("   - prompt with length %7d, usable = %7d, continued = %d\n", it->prompt.n_tokens(), n_cur, it->prompt.is_continued_by(tokens_new));
 
-        if (n_cur == 0 || n_cur < n_best || (n_cur == n_best && it_best == states.end())) {
+        if (n_cur == 0 || n_cur < n_best || (n_cur == n_best && (it_best == states.end() || (it_best->prompt.is_shared() && !it->prompt.is_shared())))) {
             continue;
         }
 
@@ -1983,6 +1989,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     // the whole cached prompt is a prefix of the new one
     if (it_best->prompt.tokens.get_common_prefix(tokens_new) == it_best->prompt.tokens.size()) {
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+    }
+
+    if (it_best->prompt.is_shared()) {
+        SRV_INF("restored the shared prefix %016llx (%d tokens)\n", (unsigned long long) it_best->id, it_best->prompt.n_tokens());
     }
 
     if (disk) {
@@ -2087,8 +2097,15 @@ std::shared_ptr<const server_cache_disk_entry> server_prompt_cache::find_disk(co
 
     for (const auto & e : disk->entries()) {
         const int32_t n_cur = n_candidate(e->prompt, e->pos_min, tokens_new);
-        if (n_cur <= n_floor || (res && n_cur <= n_candidate(res->prompt, res->pos_min, tokens_new))) {
+        if (n_cur <= n_floor) {
             continue;
+        }
+        // on a tie a shared prefix wins, as in load()
+        if (res) {
+            const int32_t n_res = n_candidate(res->prompt, res->pos_min, tokens_new);
+            if (n_cur < n_res || (n_cur == n_res && (res->prompt.is_shared() || !e->prompt.is_shared()))) {
+                continue;
+            }
         }
         if (contains(e->id)) {
             continue;
