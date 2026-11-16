@@ -1621,6 +1621,15 @@ The server supports parsing and returning reasoning via the `reasoning_content` 
 
 Reasoning input (preserve reasoning in history) is also supported by some specific templates. For more details, please refer to [PR#18994](https://github.com/ggml-org/llama.cpp/pull/18994).
 
+The response (the last chunk when streaming) carries a `reasoning_transition` object:
+
+| Member | Meaning |
+| --- | --- |
+| `started`, `completed`, `forced_tokens` | forced hand-overs (budget message + end tag) the reasoning budget sampler started and completed, and the tokens it forced; all 0 without a forced hand-over or without a budget sampler |
+| `output_limit`, `prompt_tokens`, `completion_tokens`, `cached_tokens` | the request's output limit (-1 for none) and its token counts |
+| `finish_reason` | `stop` or `length` |
+| `reasoning_open` | `true` when generation stopped inside the reasoning: in the parser's input (generation prompt + generated text) the last thinking start tag has no complete end tag after it, a partial end tag included. `false` when the end tag was written (by the model or a forced hand-over), when thinking is off or when the reply had no reasoning. `null` when the template declares no thinking tags. Independent of the budget sampler |
+
 ### POST `/v1/chat/completions/control`: Control a running chat completion in real time
 
 Acts on an in-flight completion identified by its `id` (the `id` field streamed back by `/v1/chat/completions`). The request is processed in parallel with the SSE stream, so the client sends it while still reading tokens.

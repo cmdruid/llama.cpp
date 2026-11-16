@@ -471,6 +471,29 @@ static void test_reasoning_transition() {
     fprintf(stderr, "  Test 'thinking transition' passed\n");
 }
 
+// reasoning_open: the parser's input (generation prompt + generated text) ends inside reasoning
+static void test_reasoning_open() {
+    const std::string start = "<think>";
+    const std::vector<std::string> ends = {"</think>"};
+    const std::string prompt = "<|im_start|>assistant\n<think>\n";
+
+    GGML_ASSERT(common_reasoning_open(prompt + "plan", start, ends) && "limit inside thinking");
+    GGML_ASSERT(common_reasoning_open(prompt, start, ends) && "no token generated yet");
+    GGML_ASSERT(common_reasoning_open(prompt + "plan</thi", start, ends) && "a partial end tag does not close");
+    GGML_ASSERT(!common_reasoning_open(prompt + "plan</think>", start, ends) && "natural end, zero answer tokens");
+    GGML_ASSERT(!common_reasoning_open(prompt + "plan</think>\n\n", start, ends) && "natural end, line breaks only");
+    GGML_ASSERT(!common_reasoning_open(prompt + "plan</think>\n\nHi", start, ends) && "natural end with an answer");
+    GGML_ASSERT(!common_reasoning_open(prompt + "plan Stop thinking.\n</think>", start, ends) && "forced hand-over");
+    GGML_ASSERT(!common_reasoning_open(prompt + "a</think>b<tool_call>{}</tool_call>", start, ends) && "tool call after reasoning");
+    GGML_ASSERT(common_reasoning_open(prompt + "a<tool_call>{}</tool_call>", start, ends) && "tool call inside reasoning");
+    GGML_ASSERT(common_reasoning_open(prompt + "a</think>b<think>c", start, ends) && "a second block left open");
+    GGML_ASSERT(!common_reasoning_open("<|im_start|>assistant\n<think>\n\n</think>\n\n" "Hi", start, ends) && "thinking off");
+    GGML_ASSERT(!common_reasoning_open("<|im_start|>assistant\nHi", start, ends) && "no thinking at all");
+    GGML_ASSERT(!common_reasoning_open(prompt + "a<end2>", start, {"</think>", "<end2>"}) && "any end tag closes");
+
+    fprintf(stderr, "  Test 'reasoning open' passed\n");
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -633,8 +656,9 @@ int main(void) {
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
     test_reasoning_transition();
+    test_reasoning_open();
 
-    printf("OK (13 tests passed)\n");
+    printf("OK (14 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

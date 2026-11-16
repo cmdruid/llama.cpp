@@ -2994,6 +2994,16 @@ private:
                                     {"prompt_tokens", slot.task->n_tokens()}, {"completion_tokens", slot.stats.n_gen},
                                     {"cached_tokens", slot.stats.n_prompt_cached},
                                     {"finish_reason", slot.stop == STOP_TYPE_WORD || slot.stop == STOP_TYPE_EOS ? "stop" : "length"}};
+        // the parser's input ends inside reasoning; null without the template's thinking tags
+        const auto & sp = slot.task->params.sampling;
+        json open = nullptr;
+        if (!sp.reasoning_budget_start.empty() && !sp.reasoning_budget_end.empty()) {
+            std::vector<std::string> ends;
+            for (const auto & end : sp.reasoning_budget_end) { ends.push_back(common_detokenize(vocab, end, true)); }
+            open = common_reasoning_open(sp.generation_prompt + slot.generated.text,
+                                         common_detokenize(vocab, sp.reasoning_budget_start, true), ends);
+        }
+        res->reasoning_transition["reasoning_open"] = open;
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;

@@ -58,6 +58,11 @@ struct common_reasoning_transition {
 void common_reasoning_budget_set_output_limit(struct llama_sampler * smpl, int32_t limit);
 common_reasoning_transition common_reasoning_budget_transition(const struct llama_sampler * smpl);
 
+// True when text (the parser's input: generation prompt + generated text) ends inside
+// reasoning: its last start tag has no complete end tag after it. A partial end tag counts
+// as open. Independent of the budget sampler, so it holds with or without one.
+bool common_reasoning_open(const std::string & text, const std::string & start, const std::vector<std::string> & ends);
+
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);

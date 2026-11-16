@@ -371,3 +371,16 @@ void common_reasoning_budget_set_output_limit(struct llama_sampler * smpl, int32
 common_reasoning_transition common_reasoning_budget_transition(const struct llama_sampler * smpl) {
     return smpl ? ((const common_reasoning_budget_ctx *) smpl->ctx)->transition : common_reasoning_transition{};
 }
+
+bool common_reasoning_open(const std::string & text, const std::string & start, const std::vector<std::string> & ends) {
+    const size_t s = start.empty() ? std::string::npos : text.rfind(start);
+    if (s == std::string::npos) {
+        return false;
+    }
+    for (const auto & end : ends) {
+        if (!end.empty() && text.find(end, s + start.size()) != std::string::npos) {
+            return false;
+        }
+    }
+    return true;
+}
